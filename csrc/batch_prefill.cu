@@ -200,6 +200,7 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
                                      at::Tensor paged_v_cache, at::Tensor qo_indptr,
                                      at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
                                      at::Tensor paged_kv_last_page_len, at::Tensor o,
+                                     at::Tensor tree_lens,
                                      std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                                      int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
@@ -262,6 +263,7 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
         params.paged_kv = paged_kv;
         params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
         params.o = static_cast<DTypeO*>(o.data_ptr());
+        params.tree_lens = static_cast<uint32_t*>(tree_lens.data_ptr());
 
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;

@@ -1016,6 +1016,83 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
+def test_batch_prefill_with_tree_attention(
+        batch_size,
+        kv_len,
+        qo_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        kv_layout
+):
+    torch.manual_seed(42)
+
+
+    device = torch.device("cuda:0")
+
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout=kv_layout,
+    )
+
+    #* data
+    # print(f"#Test: batch_size = {batch_size}, kv_len = {kv_len}, qo_len = {qo_len}, num_kv_heads = {num_kv_heads}, num_qo_heads = {num_qo_heads}")
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device=device,
+        dtype=torch.float16,
+        )
+    q_indptr = (
+            torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * qo_len
+    )
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+
+    if kv_layout == "HND":
+        kv_shape = [total_num_pages, 2, num_kv_heads, page_size, head_dim]
+    else: #*
+        kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]
+
+    kv_data = torch.randn(*kv_shape, dtype=torch.float16, device=device)
+    kv_indptr = (
+            torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+            * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device=device, dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device=device
+    )
+
+    #* columns of mask [qo_len, tree_len], tree_len < kv_len
+    tree_len = kv_len // 2
+    tree_lens = [tree_len] * batch_size
+    tree_lens = torch.tensor(tree_lens, dtype=torch.int32, device=device)
+    custom_mask = torch.tril(
+        torch.full((batch_size, qo_len, tree_len), True, device=device),
+        diagonal=(tree_len - qo_len),
+    ).reshape(-1)
+    print(f"#Test: custom_mask size = {custom_mask.size()}")
+
+    # use custom mask
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        custom_mask=custom_mask,
+        tree_lens=tree_lens
+    )
+
+    o_custom = wrapper.run(q, kv_data)
+
+    print(o_custom.size())
 
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
@@ -1036,3 +1113,5 @@ if __name__ == "__main__":
     test_batch_prefill_with_ragged_kv_cache_custom_mask(
         1, 137, 137, 8, 8, 128, "NONE", 0.0, False
     )
+
+    test_batch_prefill_with_tree_attention(61, 45, 23, 64, 8, 64, 128, "NHD")

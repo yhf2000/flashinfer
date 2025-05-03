@@ -365,6 +365,7 @@ def get_batch_prefill_module(backend):
                 paged_kv_indices: torch.Tensor,
                 paged_kv_last_page_len: torch.Tensor,
                 o: torch.Tensor,
+                tree_lens: torch.Tensor,
                 maybe_lse: Optional[torch.Tensor],
                 mask_mode: int,
                 layout: int,
@@ -398,6 +399,7 @@ def get_batch_prefill_module(backend):
                         paged_kv_indices,
                         paged_kv_last_page_len,
                         o,
+                        tree_lens,
                         maybe_lse,
                         mask_mode,
                         layout,
@@ -1009,6 +1011,22 @@ def _compute_page_mask_indptr(
     )
     return mask_indptr
 
+def _compute_custom_mask_indptr(
+        qo_indptr: torch.Tensor,
+        tree_lens: torch.Tensor,
+) -> torch.Tensor:
+    if len(qo_indptr) != len(tree_lens) + 1:
+        raise ValueError(
+            "The length of qo_indptr should be length of tree_lens plus 1."
+        )
+    mask_indptr = torch.empty_like(qo_indptr)
+    mask_indptr[0] = 0
+    mask_indptr[1:] = torch.cumsum(
+        (qo_indptr[1:] - qo_indptr[:-1]) * tree_lens,
+        0,
+    )
+    return mask_indptr
+
 
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
@@ -1316,6 +1334,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        tree_lens: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1404,7 +1423,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
-
+        tree_lens: Optional[torch.Tensor]
+            The tree lens of each request, shape: ``[batch_size]``. This is only effective when
+            :attr:`custom_mask` is provided in :meth:`plan`. The tree lens are used to compute the
+            custom mask indptr.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1429,11 +1451,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         batch_size = len(qo_indptr) - 1
         if custom_mask is not None or packed_custom_mask is not None:
-            mask_indptr = _compute_page_mask_indptr(
+            # mask_indptr = _compute_page_mask_indptr(
+            #     qo_indptr,
+            #     paged_kv_indptr,
+            #     paged_kv_last_page_len,
+            #     page_size,
+            # )
+            mask_indptr = _compute_custom_mask_indptr(
                 qo_indptr,
-                paged_kv_indptr,
-                paged_kv_last_page_len,
-                page_size,
+                tree_lens,
             )
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
@@ -1532,6 +1558,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 self._custom_mask_buf = None
                 self._mask_indptr_buf = None
+            self._tree_lens_buf = tree_lens.to(self.device, non_blocking=non_blocking)
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -1802,6 +1829,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             sparse_indices,
             self._paged_kv_last_page_len_buf,
             out,
+            self._tree_lens_buf,
             lse,
             mask_mode,
             TensorLayout[self._kv_layout].value,

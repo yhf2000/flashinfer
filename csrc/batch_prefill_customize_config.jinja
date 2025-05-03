@@ -68,6 +68,11 @@ struct RaggedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* tree_lens;
+
+  __host__ __device__ __forceinline__ uint32_t get_tree_len(uint32_t batch_idx) const {
+    return tree_lens[batch_idx];
+  }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -108,6 +113,11 @@ struct PagedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* tree_lens;
+
+  __host__ __device__ __forceinline__ uint32_t get_tree_len(uint32_t batch_idx) const {
+    return tree_lens[batch_idx];
+  }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
