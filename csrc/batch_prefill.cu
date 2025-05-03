@@ -263,7 +263,7 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
         params.paged_kv = paged_kv;
         params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
         params.o = static_cast<DTypeO*>(o.data_ptr());
-        params.tree_lens = static_cast<uint32_t*>(tree_lens.data_ptr());
+        params.tree_lens = static_cast<IdType*>(tree_lens.data_ptr());
 
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;
