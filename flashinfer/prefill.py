@@ -331,6 +331,7 @@ def get_batch_prefill_module(backend, *args):
             "paged_v_cache",
             "o",
             "tree_lens",
+            "dec_lens",
             "maybe_lse",
         ),
     )
@@ -347,6 +348,7 @@ def get_batch_prefill_module(backend, *args):
         paged_kv_last_page_len: torch.Tensor,
         o: torch.Tensor,
         tree_lens: torch.Tensor,
+        dec_lens: torch.Tensor,
         maybe_lse: Optional[torch.Tensor],
         mask_mode: int,
         layout: int,
@@ -382,6 +384,7 @@ def get_batch_prefill_module(backend, *args):
                 paged_kv_last_page_len,
                 o,
                 tree_lens,
+                dec_lens,
                 maybe_lse,
                 mask_mode,
                 layout,
@@ -571,6 +574,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
             "paged_v_cache",
             "o",
             "tree_lens",
+            "dec_lens",
             "maybe_lse",
         ),
     )
@@ -587,6 +591,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         paged_kv_last_page_len: torch.Tensor,
         o: torch.Tensor,
         tree_lens: torch.Tensor,
+        dec_lens: torch.Tensor,
         maybe_lse: Optional[torch.Tensor],
         mask_mode: int,
         layout: int,
@@ -606,6 +611,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
             paged_kv_last_page_len,
             o,
             tree_lens,
+            dec_lens,
             maybe_lse,
             mask_mode,
             layout,
@@ -627,6 +633,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         paged_kv_last_page_len: torch.Tensor,
         o: torch.Tensor,
         tree_lens: torch.Tensor,
+        dec_lens: torch.Tensor,
         maybe_lse: Optional[torch.Tensor],
         mask_mode: int,
         layout: int,
@@ -997,18 +1004,16 @@ def _compute_page_mask_indptr(
 
 def _compute_custom_mask_indptr(
         qo_indptr: torch.Tensor,
+        dec_lens: torch.Tensor,
         tree_lens: torch.Tensor,
 ) -> torch.Tensor:
+    if len(dec_lens) != len(tree_lens):
+        raise ValueError("The length of dec_lens should be length of tree_lens.")
     if len(qo_indptr) != len(tree_lens) + 1:
-        raise ValueError(
-            "The length of qo_indptr should be length of tree_lens plus 1."
-        )
+        raise ValueError("The length of qo_indptr should be length of tree_lens + 1.")
     mask_indptr = torch.empty_like(qo_indptr)
-    mask_indptr[0] = 0
-    mask_indptr[1:] = torch.cumsum(
-        (qo_indptr[1:] - qo_indptr[:-1]) * tree_lens,
-        0,
-    )
+    mask_indptr[0].zero_()
+    torch.cumsum(dec_lens * tree_lens,0, out=mask_indptr[1:])
     return mask_indptr
 
 
@@ -1319,6 +1324,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
         tree_lens: Optional[torch.Tensor] = None,
+        dec_lens: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1411,6 +1417,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The tree lens of each request, shape: ``[batch_size]``. This is only effective when
             :attr:`custom_mask` is provided in :meth:`plan`. The tree lens are used to compute the
             custom mask indptr.
+        dec_lens: Optional[torch.Tensor]
+            The decoder lengths of each request, shape: ``[batch_size]``. This is only effective when
+            :attr:`custom_mask` is provided in :meth:`plan`. The decoder lengths are used to compute the
+            custom mask indptr.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1443,6 +1453,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # )
             mask_indptr = _compute_custom_mask_indptr(
                 qo_indptr,
+                dec_lens,
                 tree_lens,
             )
         if packed_custom_mask is None and custom_mask is not None:
@@ -1543,6 +1554,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf = None
                 self._mask_indptr_buf = None
             self._tree_lens_buf = tree_lens.to(self.device, non_blocking=non_blocking)
+            self._dec_lens_buf = dec_lens.to(self.device, non_blocking=non_blocking)
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -1821,6 +1833,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._paged_kv_last_page_len_buf,
             out,
             self._tree_lens_buf,
+            self._dec_lens_buf,
             lse,
             mask_mode,
             TensorLayout[self._kv_layout].value,

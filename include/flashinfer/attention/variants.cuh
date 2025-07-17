@@ -38,7 +38,7 @@ struct DefaultAttention : AttentionVariantBase {
   float sm_scale_log2;
   float soft_cap_pre_tanh_scale;
 
-  uint32_t tree_len;
+  uint32_t tree_len, dec_len;
 
   // Create closure
   template <typename Params>
@@ -67,6 +67,7 @@ struct DefaultAttention : AttentionVariantBase {
       window_left = (params.window_left >= 0) ? params.window_left : kv_len;
     }
     tree_len = params.get_tree_len(batch_idx);
+    dec_len = params.get_dec_len(batch_idx);
   }
 
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
@@ -86,25 +87,16 @@ struct DefaultAttention : AttentionVariantBase {
       if (qo_idx >= qo_len || kv_idx >= kv_len) {
         mask = false;
       } else {
-//         const uint32_t offset = qo_idx * kv_len + kv_idx;
-//         mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
         uint32_t padded = kv_len - tree_len;
-        if(qo_len == kv_len){
-          if(kv_idx < padded){
-            mask = (qo_idx >= kv_idx);
-          } else {
-            if(qo_idx >= padded){
-              const uint32_t offset = qo_idx * tree_len + (kv_idx - padded);
-              mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1); //* load mask
-            }
-            else{
-              mask = false;
-            }
-          }
+        if(kv_idx < padded){  // left of full mask
+          mask = (qo_idx >= kv_idx);
         } else {
-          if (kv_idx >= padded){
-            const uint32_t offset = qo_idx * tree_len + (kv_idx - padded);
-            mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1); //* load mask
+          if(qo_idx >= kv_idx){  // tree attention
+            const uint32_t mask_idx = qo_idx - (qo_len - dec_len); // it must be in tree mask
+            const uint32_t offset = mask_idx * tree_len + (kv_idx - padded);
+            mask = ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
+          } else {
+            mask = false;
           }
         }
       }

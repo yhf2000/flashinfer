@@ -35,7 +35,7 @@ void BatchPrefillWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
     at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-    at::Tensor o, at::Tensor tree_lens, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
+    at::Tensor o, at::Tensor tree_lens, at::Tensor dec_lens, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
