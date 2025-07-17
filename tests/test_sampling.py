@@ -38,6 +38,43 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+@pytest.mark.parametrize("temperature", [1.0, 0.5, 0.1])
+@pytest.mark.parametrize("temperature_arr", [True, False])
+@pytest.mark.parametrize("neg_inf_input", [True, False])
+def test_softmax(
+    batch_size, vocab_size, distribution, temperature, temperature_arr, neg_inf_input
+):
+    torch.manual_seed(42)
+    logits = distribution((batch_size, vocab_size), "cuda:0")
+    if neg_inf_input:
+        # assign random logits to -inf
+        num_inf = torch.randint(0, logits.numel() - 1, (), device=logits.device).item()
+        inf_idx = torch.randperm(logits.numel(), device=logits.device)[:num_inf]
+        logits.view(-1).index_fill_(0, inf_idx, float("-inf"))
+
+    if temperature_arr:
+        temperature_arr = torch.full((batch_size,), temperature, device="cuda:0")
+        probs = flashinfer.sampling.softmax(logits, temperature=temperature_arr)
+        logits_scaled = logits / temperature_arr.unsqueeze(-1)
+    else:
+        probs = flashinfer.sampling.softmax(logits, temperature=temperature)
+        logits_scaled = logits / temperature
+
+    probs_ref = torch.softmax(logits_scaled, dim=-1)
+
+    assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
@@ -406,11 +443,16 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
-def test_top_k_mask_logits(batch_size, vocab_size, k):
+@pytest.mark.parametrize("neginf_input", [False, True])
+def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    if neginf_input:
+        num_neginf = torch.randint(1, vocab_size * batch_size, (1,)).item()
+        idxs = torch.randperm(batch_size * vocab_size, device="cuda:0")[:num_neginf]
+        logits[idxs // vocab_size, idxs % vocab_size] = -float("inf")
     probs = torch.softmax(logits, dim=-1)
     masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
     renormed_probs = torch.softmax(masked_logits, dim=-1)

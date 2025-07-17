@@ -301,8 +301,43 @@ def is_fa3_backend_supported(
         return False
     if use_fp16_qk_reductions:
         return False
-    # NOTE: currently fp8 is not supported in our FA3 backend
-    # will add support soon
+    return True
+
+
+def is_cutlass_backend_supported(
+    pos_encoding_mode: int,
+    use_fp16_qk_reductions: bool,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """
+    Check if the cutlass backend is supported based on the given parameters.
+
+    Parameters
+    ----------
+    pos_encoding_mode : int
+        The positional encoding mode.
+    use_fp16_qk_reductions : bool
+        Whether FP16 QK reductions are allowed.
+    use_custom_mask : bool
+        Whether a custom mask is used.
+    dtype_q : torch.dtype
+        The data type of the query tensor.
+    dtype_kv : torch.dtype
+        The data type of the key-value tensor.
+
+    Returns
+    -------
+    bool
+        True if the cutlass backend is supported, False otherwise.
+    """
+    if use_custom_mask:
+        return False
+    if pos_encoding_mode != PosEncodingMode.NONE.value:
+        return False
+    if use_fp16_qk_reductions:
+        return False
     if dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]:
         return False
     if dtype_kv in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -355,14 +390,20 @@ def determine_attention_backend(
         return "fa2"
 
 
+def version_at_least(version: str, base_version: str) -> bool:
+    from packaging import version as pkg_version
+
+    return pkg_version.parse(version) >= pkg_version.parse(base_version)
+
+
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
-    return major == 9 and torch.version.cuda >= "12.3"
+    return major == 9 and version_at_least(torch.version.cuda, "12.3")
 
 
 def is_sm100a_supported(device: torch.device) -> bool:
-    major, minor = get_compute_capability(device)
-    return major == 10 and minor == 0 and torch.version.cuda >= "12.9"
+    major, _ = get_compute_capability(device)
+    return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -388,3 +429,96 @@ def _check_shape_dtype_device(
         raise ValueError(
             f"Invalid device of {name}: expected {expected_device}, got {x.device}"
         )
+
+
+def get_logging_module():
+    return gen_jit_spec(
+        "logging",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
+        ],
+        extra_include_paths=[
+            jit_env.SPDLOG_INCLUDE_DIR,
+            jit_env.FLASHINFER_INCLUDE_DIR,
+        ],
+    ).build_and_load()
+
+
+class LogLevel(Enum):
+    TRACE = 0
+    DEBUG = 1
+    INFO = 2
+    WARN = 3
+    ERROR = 4
+    CRITICAL = 5
+
+
+log_level_map = {
+    "trace": LogLevel.TRACE,
+    "debug": LogLevel.DEBUG,
+    "info": LogLevel.INFO,
+    "warn": LogLevel.WARN,
+    "error": LogLevel.ERROR,
+    "critical": LogLevel.CRITICAL,
+}
+
+
+def set_log_level(lvl_str: str) -> None:
+    get_logging_module().set_log_level(log_level_map[lvl_str].value)
+
+
+def device_support_pdl(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major >= 9
+
+
+def round_up(x: int, y: int) -> int:
+    """Round up x to the nearest multiple of y"""
+    return (x + y - 1) // y * y
+
+
+def ceil_div(x: int, y: int) -> int:
+    """
+    Perform ceiling division of two integers.
+
+    Args:
+        x: the dividend.
+        y: the divisor.
+
+    Returns:
+        The result of the ceiling division.
+    """
+    return (x + y - 1) // y
+
+
+def _ceil_to_ue8m0(x: torch.Tensor):
+    """imported from DeepGEMM"""
+    assert x.view(-1).amax().item() > 0
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
+
+def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """imported from DeepGEMM"""
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    m, n = x.shape
+    x_view = x.view(m, -1, 128)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    sf = _ceil_to_ue8m0(x_amax / 448.0)
+    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), sf
+
+
+def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """imported from DeepGEMM"""
+    assert x.dim() == 2
+    m, n = x.shape
+    x_padded = torch.zeros(
+        (round_up(m, 128), round_up(n, 128)), dtype=x.dtype, device=x.device
+    )
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = _ceil_to_ue8m0(x_amax / 448.0)
+    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
+        x_view.size(0), x_view.size(2)
+    )

@@ -27,13 +27,15 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, cudaStream_t stream);
+                                                   float* tmp_s, bool enable_pdl,
+                                                   cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, cudaStream_t stream);
+                                                    float* tmp_s, bool enable_pdl,
+                                                    cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -212,7 +214,7 @@ void BatchPrefillWithRaggedKVCacheRun(DLTensor* float_workspace_buffer,
           status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              RaggedParams>(params, tmp_v, tmp_s, stream);
+              RaggedParams>(params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
         });
 
         CHECK(status == cudaSuccess)
@@ -371,7 +373,7 @@ void BatchPrefillWithPagedKVCacheRun(DLTensor* float_workspace_buffer,
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, stream);
+              PagedParams>(params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
         });
 
         CHECK(status == cudaSuccess)

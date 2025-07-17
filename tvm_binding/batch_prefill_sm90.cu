@@ -28,11 +28,13 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream);
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                    cudaStream_t stream);
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                   cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -182,7 +184,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
           cudaError_t status = BatchPrefillWithRaggedKVCacheDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
-              AttentionVariant>(params, stream);
+              AttentionVariant>(params, /*enable_pdl=*/false, stream);
           CHECK(status == cudaSuccess) << "BatchPrefillWithRaggedKVCacheSM90Run failed with error: "
                                        << cudaGetErrorString(status);
           return true;

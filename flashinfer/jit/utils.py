@@ -15,12 +15,8 @@ limitations under the License.
 """
 
 import pathlib
-import threading
-from typing import Any, Callable, List, Tuple
 
 import torch
-
-from .core import logger
 
 
 def write_if_different(path: pathlib.Path, content: str) -> None:
@@ -34,34 +30,6 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
         f.write(content)
 
 
-def parallel_load_modules(
-    load_module_func_args: List[Tuple[Callable, List[Any]]],
-):
-    threads = []
-    exceptions = []
-
-    def wrapper(func, args):
-        try:
-            func(*args)
-        except Exception as e:
-            exceptions.append((func, e))
-
-    for func, args in load_module_func_args:
-        thread = threading.Thread(target=wrapper, args=(func, args))
-        thread.start()
-        threads.append(thread)
-
-    for thread in threads:
-        thread.join()
-
-    if exceptions:
-        for func, e in exceptions:
-            print(f"Exception occurred in {func.__name__}: {e}")
-        raise RuntimeError("One or more exceptions occurred during module loading")
-
-    logger.info("Finished loading modules")
-
-
 dtype_map = {
     torch.float16: "half",
     torch.bfloat16: "nv_bfloat16",
@@ -73,6 +41,19 @@ dtype_map = {
     torch.uint32: "uint32_t",
     torch.int64: "int64_t",
     torch.uint64: "uint64_t",
+}
+
+dtype_cutlass_map = {
+    torch.float16: "cutlass::half_t",
+    torch.bfloat16: "cutlass::bfloat16_t",
+    torch.float8_e4m3fn: "cutlass::float_e4m3_t",
+    torch.float8_e5m2: "cutlass::float_e5m2_t",
+    torch.int8: "cutlass::int8_t",
+    torch.uint8: "cutlass::uint8_t",
+    torch.int32: "cutlass::int32_t",
+    torch.uint32: "cutlass::uint32_t",
+    torch.int64: "cutlass::int64_t",
+    torch.uint64: "cutlass::uint64_t",
 }
 
 filename_safe_dtype_map = {

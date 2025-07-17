@@ -22,8 +22,8 @@
 #include "cutlass/kernel_hardware_info.h"
 
 // From 3rdparty/cutlass/examples/77_blackwell_fmha
-#include "device/sm100_mla.hpp"
-#include "kernel/sm100_mla_tile_scheduler.hpp"
+#include "blackwell/device/sm100_mla.hpp"
+#include "blackwell/kernel/sm100_mla_tile_scheduler.hpp"
 
 namespace flashinfer {
 
@@ -31,16 +31,6 @@ namespace attention {
 
 using namespace cute;
 using namespace cutlass::fmha::kernel;
-
-#define CUTLASS_CHECK(cmd)                                                            \
-  do {                                                                                \
-    auto status = cmd;                                                                \
-    if (status != cutlass::Status::kSuccess) {                                        \
-      std::ostringstream err_msg;                                                     \
-      err_msg << "cutlass " << #cmd << " failed: " << cutlassGetStatusString(status); \
-      FLASHINFER_ERROR(err_msg.str());                                                \
-    }                                                                                 \
-  } while (0)
 
 template <bool v>
 struct IsPersistent {

@@ -14,10 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from ._build_meta import __version__ as __version__
+try:
+    from ._build_meta import __version__ as __version__
+except ModuleNotFoundError:
+    __version__ = "0.0.0+unknown"
+
+
+from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
+from .attention import BatchAttention as BatchAttention
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
 )
@@ -39,7 +46,23 @@ from .decode import (
 from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
 )
+from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .fp4_quantization import (
+    block_scale_interleave,
+    e2m1_and_ufp8sf_scale_to_float,
+    fp4_quantize,
+)
+from .fused_moe import (
+    RoutingMethodType,
+    cutlass_fused_moe,
+    reorder_rows_for_gated_act_gemm,
+    shuffle_matrix_a,
+    shuffle_matrix_sf_a,
+    trtllm_fp4_block_scale_moe,
+    trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe,
+)
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
@@ -82,6 +105,7 @@ from .sampling import chain_speculative_sampling as chain_speculative_sampling
 from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
 from .sampling import sampling_from_logits as sampling_from_logits
 from .sampling import sampling_from_probs as sampling_from_probs
+from .sampling import softmax as softmax
 from .sampling import top_k_mask_logits as top_k_mask_logits
 from .sampling import top_k_renorm_probs as top_k_renorm_probs
 from .sampling import top_k_sampling_from_probs as top_k_sampling_from_probs

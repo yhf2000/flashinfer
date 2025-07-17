@@ -27,7 +27,8 @@ namespace flashinfer {
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, cudaStream_t stream);
+                                                  float* tmp_s, bool enable_pdl,
+                                                  cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -207,9 +208,8 @@ void BatchDecodeWithPagedKVCacheRun(
 
         cudaError_t status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
-                                                              AttentionVariant>(params, tmp_v,
-                                                                                tmp_s,
-                                                                                /*stream=*/stream);
+                                                              AttentionVariant>(
+                params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
         CHECK(status == cudaSuccess)
             << "BatchDecodeWithPagedKVCache failed with error " << cudaGetErrorString(status);
         return true;
