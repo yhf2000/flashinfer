@@ -88,15 +88,14 @@ struct DefaultAttention : AttentionVariantBase {
         mask = false;
       } else {
         uint32_t padded = kv_len - tree_len;
-        if(kv_idx < padded){  // left of full mask
-          mask = (qo_idx >= kv_idx);
+        const uint32_t g_qo_idx = qo_idx + (kv_len - qo_len);
+        if (g_qo_idx < kv_idx){
+            mask = false;
         } else {
-          if(qo_idx >= kv_idx){  // tree attention
+          if (kv_idx >= padded){
             const uint32_t mask_idx = qo_idx - (qo_len - dec_len); // it must be in tree mask
             const uint32_t offset = mask_idx * tree_len + (kv_idx - padded);
-            mask = ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
-          } else {
-            mask = false;
+            mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
           }
         }
       }
