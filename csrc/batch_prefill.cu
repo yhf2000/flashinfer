@@ -201,7 +201,8 @@ void BatchPrefillWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
     at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-    at::Tensor o, at::Tensor tree_lens, at::Tensor dec_lens, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
+    at::Tensor o, at::Tensor tree_lens, at::Tensor dec_lens, at::Tensor infer_lens, 
+    std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
@@ -265,6 +266,7 @@ void BatchPrefillWithPagedKVCacheRun(
         params.o = static_cast<DTypeO*>(o.data_ptr());
         params.tree_lens = static_cast<uint32_t*>(tree_lens.data_ptr());
         params.dec_lens = static_cast<uint32_t*>(dec_lens.data_ptr());
+        params.infer_lens = static_cast<uint32_t*>(infer_lens.data_ptr());
 
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;

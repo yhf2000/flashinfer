@@ -70,6 +70,7 @@ struct RaggedParams {
   bool partition_kv;
   uint32_t* tree_lens;
   uint32_t* dec_lens;
+  uint32_t* infer_lens;
 
   __host__ __device__ __forceinline__ uint32_t get_tree_len(uint32_t batch_idx) const {
     return tree_lens[batch_idx];
@@ -77,6 +78,10 @@ struct RaggedParams {
 
   __host__ __device__ __forceinline__ uint32_t get_dec_len(uint32_t batch_idx) const {
     return dec_lens[batch_idx];
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_infer_len(uint32_t batch_idx) const {
+    return infer_lens[batch_idx];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
@@ -120,6 +125,7 @@ struct PagedParams {
   bool partition_kv;
   uint32_t* tree_lens;
   uint32_t* dec_lens;
+  uint32_t* infer_lens;
 
   __host__ __device__ __forceinline__ uint32_t get_tree_len(uint32_t batch_idx) const {
     return tree_lens[batch_idx];
@@ -127,6 +133,10 @@ struct PagedParams {
 
   __host__ __device__ __forceinline__ uint32_t get_dec_len(uint32_t batch_idx) const {
     return dec_lens[batch_idx];
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_infer_len(uint32_t batch_idx) const {
+    return infer_lens[batch_idx];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
