@@ -18,26 +18,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "flashinfer/fp4_layout.cuh"
 #include "tensorrt_llm/common/quantization.h"
 
 namespace tensorrt_llm {
-
-enum class QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  //
-  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-  SWIZZLED,
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
-};
+using flashinfer::QuantizationSFLayout;
 
 // This denotes the input and output data types of the block scale quantization.
 enum class BlockScaleQuantizationType {
@@ -49,8 +34,8 @@ enum class BlockScaleQuantizationType {
 #define PadUpFn(X, Y) ((X + Y - 1) / (Y) * (Y))
 
 // totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
-inline int64_t computeSwizzledLayoutSFSize(int totalRow, int totalColumn) {
-  int paddedRow = PadUpFn(totalRow, 128);
+inline int64_t computeSwizzledLayoutSFSize(int totalRow, int totalColumn, int rowSize = 128) {
+  int paddedRow = PadUpFn(totalRow, rowSize);
   int paddedColumn = PadUpFn(totalColumn, 4);
   return static_cast<int64_t>(paddedRow) * paddedColumn;
 }
@@ -71,16 +56,11 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
                                 float* sumPtr, tensorrt_llm::common::QuantMode quantMode,
                                 cudaStream_t stream = 0);
 
-template <typename T, int SF_VEC_SIZE = 16>
+template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
                            int64_t* output, int32_t* SFOuput, bool useUE8M0,
                            QuantizationSFLayout layout, int multiProcessorCount,
-                           cudaStream_t stream = 0);
-
-template <typename T>
-void invokeMxFP8Quantization(int b, int m, int n, T const* input, int64_t* output, int32_t* SFOuput,
-                             QuantizationSFLayout layout, int multiProcessorCount,
-                             cudaStream_t stream = 0);
+                           bool enable_pdl = false, cudaStream_t stream = 0);
 
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
                                 uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount,
@@ -88,6 +68,11 @@ void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
 
 void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput,
                                        int multiProcessorCount, cudaStream_t stream = 0);
+
+template <typename T>
+void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output,
+                             int32_t* SFOuput, QuantizationSFLayout layout, int multiProcessorCount,
+                             bool enable_pdl = false, cudaStream_t stream = 0);
 
 }  // namespace kernels
 }  // namespace tensorrt_llm

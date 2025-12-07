@@ -19,6 +19,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_fp8.h>
 #include <limits.h>
 #include <stdint.h>
 #ifndef _WIN32  // Linux
@@ -194,19 +195,6 @@ inline static bool getBoolEnv(char const* name) {
 inline bool getEnvUseTileSizeKv64ForTrtllmGen() {
   static bool const useTileSizeKv64 = getBoolEnv("TRTLLM_GEN_ENABLE_TILE_SIZE_KV64");
   return useTileSizeKv64;
-}
-
-inline bool getEnvEnablePDL() {
-  static std::once_flag flag;
-  static bool enablePDL = false;
-
-  std::call_once(flag, [&]() {
-    if (getSMVersion() >= 90) {
-      // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-      enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
-    }
-  });
-  return enablePDL;
 }
 template <typename T>
 inline __device__ __host__ T divUp(T m, T n) {

@@ -19,12 +19,14 @@ import platform
 import re
 import subprocess
 from pathlib import Path
+from typing import List, Mapping
 
 import setuptools
+from setuptools.dist import Distribution
 
 root = Path(__file__).parent.resolve()
 aot_ops_package_dir = root / "build" / "aot-ops-package-dir"
-enable_aot = aot_ops_package_dir.is_symlink()
+enable_aot = aot_ops_package_dir.is_dir() and any(aot_ops_package_dir.iterdir())
 
 
 def write_if_different(path: Path, content: str) -> None:
@@ -49,19 +51,18 @@ def generate_build_meta(aot_build_meta: dict) -> None:
     write_if_different(root / "flashinfer" / "_build_meta.py", build_meta_str)
 
 
-ext_modules = []
-cmdclass = {}
+ext_modules: List[setuptools.Extension] = []
+cmdclass: Mapping[str, type[setuptools.Command]] = {}
 install_requires = [
     "numpy",
     "torch",
     "ninja",
     "requests",
-    "cuda-python",
+    "cuda-python<=12.9",
     "pynvml",
     "einops",
-    "nvidia-nvshmem-cu12",
-    "nvidia-cudnn-cu12",
-    "nvidia-cudnn-frontend",
+    "packaging>=24.2",
+    "nvidia-cudnn-frontend>=1.13.0",
 ]
 generate_build_meta({})
 
@@ -69,16 +70,6 @@ if enable_aot:
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
     from packaging.version import Version
-    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-
-    class impure_bdist_wheel(_bdist_wheel):
-        def finalize_options(self):
-            _bdist_wheel.finalize_options(self)
-            self.root_is_pure = False
-
-    # Make sure that the wheel has correct platform tag.
-    # See https://stackoverflow.com/questions/45150304/how-to-force-a-python-wheel-to-be-platform-specific-when-building-it
-    cmdclass["bdist_wheel"] = impure_bdist_wheel
 
     def get_cuda_version() -> Version:
         if torch_cpp_ext.CUDA_HOME is None:
@@ -102,10 +93,17 @@ if enable_aot:
     aot_build_meta["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST")
     generate_build_meta(aot_build_meta)
 
+
+class AotDistribution(Distribution):
+    def has_ext_modules(self) -> bool:
+        return enable_aot
+
+
 setuptools.setup(
     version=get_version(),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     install_requires=install_requires,
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    distclass=AotDistribution,
 )
