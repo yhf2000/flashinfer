@@ -395,6 +395,33 @@ def get_batch_prefill_uri(
     )
 
 
+def get_batch_tree_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> str:
+    return (
+        f"batch_tree_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}_"
+        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+    )
+
+
 def get_batch_prefill_attention_sink_uri(
     backend: str,
     dtype_q: torch.dtype,
@@ -1048,6 +1075,181 @@ def gen_batch_prefill_module(
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
     return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+        fp8_enabled=fp8_enabled,
+    )
+
+
+def gen_customize_batch_tree_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+) -> JitSpec:
+    if backend != "fa2":
+        raise NotImplementedError("BatchTree module currently only supports fa2 backend")
+    if fp8_enabled:
+        raise NotImplementedError("BatchTree module does not support fp8 tensor core")
+
+    kwargs = {
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[idtype],
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    (additional_params_decl, additional_func_params, additional_params_setter) = (
+        generate_additional_params(
+            additional_tensor_names,
+            additional_tensor_dtypes,
+            additional_scalar_names,
+            additional_scalar_dtypes,
+        )
+    )
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_tree_customize_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_tree_paged_kernel_inst.jinja") as f:
+        paged_kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs |= {
+        "additional_params_decl": additional_params_decl,
+        "additional_func_params": additional_func_params,
+        "additional_params_setter": additional_params_setter,
+    }
+
+    generated_inc_str = config_templ.render(**kwargs)
+    os.makedirs(gen_directory, exist_ok=True)
+
+    source_paths = []
+    for mask_mode in [0, 1, 2, 3]:
+        dest_path = gen_directory / f"batch_tree_paged_kernel_mask_{mask_mode}.cu"
+        source_paths.append(dest_path)
+        source = paged_kernel_inst_templ.render(
+            mask_mode=mask_mode_literal[mask_mode],
+            **kwargs,
+        )
+        write_if_different(dest_path, source)
+
+    for filename in [
+        "batch_tree.cu",
+        "batch_tree_jit_binding.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "batch_tree_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+    return gen_jit_spec(uri, source_paths)
+
+
+def gen_batch_tree_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> JitSpec:
+    uri = get_batch_tree_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+    )
+
+    if backend != "fa2":
+        raise NotImplementedError("BatchTree module currently only supports fa2 backend")
+
+    fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
+    assert not fp8_enabled, "fp8 tensor core is not supported in BatchTree/fa2"
+
+    additional_tensor_names = [
+        "maybe_custom_mask",
+        "maybe_mask_indptr",
+        "maybe_alibi_slopes",
+        "maybe_prefix_len_ptr",
+        "maybe_token_pos_in_items_ptr",
+        "maybe_max_item_len_ptr",
+    ]
+    additional_tensor_dtypes = [
+        "uint8_t",
+        "int32_t",
+        "float",
+        "uint32_t",
+        "uint16_t",
+        "uint16_t",
+    ]
+    additional_scalar_names = [
+        "logits_soft_cap",
+        "sm_scale",
+        "rope_rcp_scale",
+        "rope_rcp_theta",
+        "token_pos_in_items_len",
+    ]
+    additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
+    variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
+
+    return gen_customize_batch_tree_module(
         backend,
         uri,
         dtype_q,

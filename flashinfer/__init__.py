@@ -107,6 +107,9 @@ from .prefill import (
 from .prefill import (
     BatchPrefillWithRaggedKVCacheWrapper as BatchPrefillWithRaggedKVCacheWrapper,
 )
+from .tree import (
+    BatchTreeWithPagedKVCacheWrapper as BatchTreeWithPagedKVCacheWrapper,
+)
 from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cache
 from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
