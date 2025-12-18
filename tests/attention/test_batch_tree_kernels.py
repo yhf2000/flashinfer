@@ -17,7 +17,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=64,
         num_kv_heads=1,
-        anc_array_len=1,
+        max_tree_height=2,
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -27,7 +27,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=64,
         num_kv_heads=4,
-        anc_array_len=4,  # exactly one packed word of ancestors
+        max_tree_height=5,  # 4 ancestors => exactly one packed word
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -37,7 +37,7 @@ _TREE_KERNEL_CASES = [
         group_size=2,
         head_dim=64,
         num_kv_heads=4,
-        anc_array_len=5,  # crosses 4-byte packing boundary
+        max_tree_height=6,  # 5 ancestors => crosses 4-byte packing boundary
         pos_encoding_mode="NONE",
     ),
     # Depth == 1 (no ancestors): mask degenerates to identity.
@@ -48,7 +48,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=1,
         pos_encoding_mode="NONE",
         max_depth=1,
         max_width=254,
@@ -61,7 +61,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=1,
+        max_tree_height=2,
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -71,7 +71,7 @@ _TREE_KERNEL_CASES = [
         group_size=4,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=9,
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -81,7 +81,7 @@ _TREE_KERNEL_CASES = [
         group_size=2,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=9,  # another packing boundary
+        max_tree_height=10,  # another packing boundary
         pos_encoding_mode="NONE",
     ),
     # Stress long sequences / many pages.
@@ -92,7 +92,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=1,
+        max_tree_height=2,
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -102,7 +102,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=17,
+        max_tree_height=18,
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -112,7 +112,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=4,
+        max_tree_height=5,
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -122,7 +122,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=1,
+        max_tree_height=2,
         pos_encoding_mode="NONE",
         max_width=64,
     ),
@@ -134,7 +134,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=4,
+        max_tree_height=5,
         pos_encoding_mode="NONE",
         max_depth=2,
         max_width=254,
@@ -147,7 +147,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=9,
         pos_encoding_mode="NONE",
     ),
     # Stress group_size / GQA and head_dim.
@@ -158,7 +158,7 @@ _TREE_KERNEL_CASES = [
         group_size=8,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=12,
+        max_tree_height=13,
         pos_encoding_mode="NONE",
     ),
     dict(
@@ -168,7 +168,7 @@ _TREE_KERNEL_CASES = [
         group_size=4,
         head_dim=256,
         num_kv_heads=4,
-        anc_array_len=13,
+        max_tree_height=14,
         pos_encoding_mode="NONE",
     ),
     # Non-contiguous tree_info/KV variants.
@@ -179,7 +179,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=9,
         pos_encoding_mode="NONE",
         tree_info_variant="word_stride2",
     ),
@@ -190,7 +190,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=9,
         pos_encoding_mode="NONE",
         tree_info_variant="entry_stride2",
     ),
@@ -201,7 +201,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=9,
         pos_encoding_mode="NONE",
         kv_variant="noncontig_head",
     ),
@@ -213,7 +213,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=9,
         pos_encoding_mode="NONE",
         extra_sche_words=7,
     ),
@@ -225,9 +225,9 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=8,
+        max_tree_height=9,
         pos_encoding_mode="NONE",
-        pos_base=(1 << 23) - 64,
+        pos_base=(1 << 22) - 64,
     ),
     # RoPE cases: limited set to avoid exploding JIT variants.
     dict(
@@ -237,7 +237,7 @@ _TREE_KERNEL_CASES = [
         group_size=2,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=9,
+        max_tree_height=10,
         pos_encoding_mode="ROPE_LLAMA",
     ),
     dict(
@@ -247,7 +247,7 @@ _TREE_KERNEL_CASES = [
         group_size=1,
         head_dim=128,
         num_kv_heads=4,
-        anc_array_len=17,
+        max_tree_height=18,
         pos_encoding_mode="ROPE_LLAMA",
         pos_base=4096,
     ),
@@ -267,8 +267,8 @@ def warmup_jit():
     prefill_head_dims = set()
     for c in cases:
         head_dim = int(c["head_dim"])
-        anc_array_len = int(c["anc_array_len"])
-        twpq = 1 + ((anc_array_len + 3) // 4)
+        max_tree_height = int(c["max_tree_height"])
+        twpq = 1 + ((max_tree_height - 1 + 3) // 4)
         pos_mode = 0 if c.get("pos_encoding_mode", "NONE") == "NONE" else 1
         tree_variants.add((head_dim, pos_mode, twpq))
         prefill_head_dims.add(head_dim)
@@ -461,7 +461,7 @@ def _generate_structured_tree_sequence_with_main_path(
 def _build_tree_info_pages(
     *,
     batch_trees: List[_TreeSequence],
-    anc_array_len: int,
+    max_tree_height: int,
     page_size: int,
     pos_base: int = 0,
     extra_sche_words: int = 0,
@@ -473,11 +473,12 @@ def _build_tree_info_pages(
 
     tree_info layout (uint32):
       word0: [is_build(1b) | token_id(31b)]                (not used by attention)
-      word1: [is_delete(1b) | position_id(23b) | inner_id(8b)]
+      word1: [is_delete(1b) | is_ghost(1b) | position_id(22b) | inner_id(8b)]
       word2..: packed ancestor bytes (4 per uint32), nearest-first
     """
-    if anc_array_len <= 0:
-        raise ValueError("anc_array_len must be > 0")
+    if max_tree_height <= 0:
+        raise ValueError("max_tree_height must be >= 1")
+    anc_array_len = max(0, int(max_tree_height) - 1)
 
     batch_size = len(batch_trees)
     seq_len = len(batch_trees[0].position_id)
@@ -495,8 +496,9 @@ def _build_tree_info_pages(
     )
     pos_ids = torch.zeros((batch_size, padded_len), device=device, dtype=torch.int32)
 
-    # is_delete is currently always 0 for the randomized tests (see delete-specific test below).
+    # is_delete/is_ghost are 0 for randomized tests (see focused tests below).
     is_delete = torch.zeros((batch_size, seq_len), device=device, dtype=torch.int64)
+    is_ghost = torch.zeros((batch_size, seq_len), device=device, dtype=torch.int64)
 
     for b, t in enumerate(batch_trees):
         pos = torch.tensor(t.position_id, device=device, dtype=torch.int32) + int(pos_base)
@@ -510,7 +512,8 @@ def _build_tree_info_pages(
         # word1: [is_delete|position_id|inner_id]
         tree_info_tok[b, :seq_len, 1] = (
             (is_delete[b] << 31)
-            | ((pos.to(torch.int64) & ((1 << 23) - 1)) << 8)
+            | (is_ghost[b] << 30)
+            | ((pos.to(torch.int64) & ((1 << 22) - 1)) << 8)
             | (inner.to(torch.int64) & 0xFF)
         )
 
@@ -624,11 +627,12 @@ def _pack_paged_kv_from_tokens(
 def _tree_mask_dense(
     *,
     batch_trees: List[_TreeSequence],
-    anc_array_len: int,
+    max_tree_height: int,
     pos_base: int = 0,
     device: torch.device,
 ) -> torch.Tensor:
     """Dense custom mask (flattened) matching tree_mask rules."""
+    anc_array_len = max(0, int(max_tree_height) - 1)
     batch_size = len(batch_trees)
     seq_len = len(batch_trees[0].position_id)
     pos = torch.stack(
@@ -673,6 +677,11 @@ def _tree_mask_dense(
     diff0 = diff == 0
     match0 = diff0 & (inner_k == inner_q)
 
+    if anc_array_len == 0:
+        # MAX_TREE_HEIGHT == 1: only allow diff == 0 (no ancestor bytes are meaningful/available).
+        mask = valid & match0
+        return mask.reshape(-1)
+
     diffgt0 = diff > 0
     # Lookup ancestor inner_id for each (q,k) by selecting anc[b, q, diff-1].
     #
@@ -707,7 +716,7 @@ def _tree_mask_dense(
             "group_size",
             "head_dim",
             "num_kv_heads",
-            "anc_array_len",
+            "max_tree_height",
             "tree_info_variant",
             "kv_variant",
             "extra_sche_words",
@@ -725,7 +734,7 @@ def test_batch_tree_with_paged_kv_cache_against_prefill_custom_mask(case):
     group_size = int(case["group_size"])
     head_dim = int(case["head_dim"])
     num_kv_heads = int(case["num_kv_heads"])
-    anc_array_len = int(case["anc_array_len"])
+    max_tree_height = int(case["max_tree_height"])
     pos_encoding_mode = case.get("pos_encoding_mode", "NONE")
     tree_info_variant = case.get("tree_info_variant", "contiguous")
     kv_variant = case.get("kv_variant", "contiguous")
@@ -741,7 +750,7 @@ def test_batch_tree_with_paged_kv_cache_against_prefill_custom_mask(case):
         + page_size * 10
         + group_size
         + (0 if pos_encoding_mode == "NONE" else 1)
-        + anc_array_len * 3
+        + max_tree_height * 3
     )
 
     device = torch.device("cuda:0")
@@ -759,7 +768,7 @@ def test_batch_tree_with_paged_kv_cache_against_prefill_custom_mask(case):
     # Build tree_info pages and per-token position ids.
     tree_info, pos_ids = _build_tree_info_pages(
         batch_trees=batch_trees,
-        anc_array_len=anc_array_len,
+        max_tree_height=max_tree_height,
         page_size=page_size,
         pos_base=pos_base,
         extra_sche_words=extra_sche_words,
@@ -770,7 +779,7 @@ def test_batch_tree_with_paged_kv_cache_against_prefill_custom_mask(case):
     # Build dense custom mask for baseline prefill kernel.
     custom_mask = _tree_mask_dense(
         batch_trees=batch_trees,
-        anc_array_len=anc_array_len,
+        max_tree_height=max_tree_height,
         pos_base=pos_base,
         device=device,
     )
@@ -878,17 +887,16 @@ def test_batch_tree_with_paged_kv_cache_against_prefill_custom_mask(case):
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        tree_info,
         num_qo_heads,
         num_kv_heads,
         head_dim,
         page_size,
+        max_tree_height=max_tree_height,
         causal=False,
         pos_encoding_mode=tree_pos_mode,
-        anc_array_len=anc_array_len,
     )
-    o_tree, lse_tree = tree.run(
-        q_tree, (k_cache_tree, v_cache), return_lse=True, tree_info=tree_info
-    )
+    o_tree, lse_tree = tree.run(q_tree, (k_cache_tree, v_cache), return_lse=True)
 
     torch.testing.assert_close(o_tree, o_base, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse_tree, lse_base, rtol=1e-3, atol=1e-3)
@@ -906,7 +914,7 @@ def test_batch_tree_mask_respects_is_delete():
     batch_size = 1
     seq_len = 16
     page_size = 16
-    anc_array_len = 8
+    max_tree_height = 9
     num_kv_heads = 4
     num_qo_heads = 4
 
@@ -922,7 +930,7 @@ def test_batch_tree_mask_respects_is_delete():
     else:
         raise RuntimeError("Failed to generate a tree with depth >= 2 for is_delete test")
     tree_info, _ = _build_tree_info_pages(
-        batch_trees=[tree_seq], anc_array_len=anc_array_len, page_size=page_size, device=device
+        batch_trees=[tree_seq], max_tree_height=max_tree_height, page_size=page_size, device=device
     )
 
     # Mark a key token (with position_id > 0) as deleted in tree_info word1.
@@ -938,7 +946,7 @@ def test_batch_tree_mask_respects_is_delete():
 
     # Build custom mask baseline with the same deletion (mask out token 0 for all queries).
     custom_mask = _tree_mask_dense(
-        batch_trees=[tree_seq], anc_array_len=anc_array_len, device=device
+        batch_trees=[tree_seq], max_tree_height=max_tree_height, device=device
     ).view(1, seq_len, seq_len)
     custom_mask[:, :, del_idx] = False
     custom_mask = custom_mask.reshape(-1)
@@ -980,15 +988,109 @@ def test_batch_tree_mask_respects_is_delete():
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        tree_info,
         num_qo_heads,
         num_kv_heads,
         head_dim,
         page_size,
         causal=False,
         pos_encoding_mode="NONE",
-        anc_array_len=anc_array_len,
+        max_tree_height=max_tree_height,
     )
-    o_tree = tree.run(q, (k_cache, v_cache), tree_info=tree_info)
+    o_tree = tree.run(q, (k_cache, v_cache))
+
+    torch.testing.assert_close(o_tree, o_base, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for tree kernel tests")
+def test_batch_tree_mask_respects_is_ghost():
+    """
+    Focused test for the is_ghost rule:
+      if (kv.is_delete | kv.is_ghost) != 0 => masked (false)
+    """
+    device = torch.device("cuda:0")
+    dtype = torch.float16
+    head_dim = 128
+    batch_size = 1
+    seq_len = 16
+    page_size = 16
+    max_tree_height = 9
+    num_kv_heads = 4
+    num_qo_heads = 4
+
+    rng = torch.Generator(device="cpu").manual_seed(1)
+    for _ in range(50):
+        tree_seq = _generate_random_tree_sequence(
+            seq_len=seq_len, max_depth=8, max_width=8, rng=rng
+        )
+        if any(p > 0 for p in tree_seq.position_id):
+            break
+    else:
+        raise RuntimeError("Failed to generate a tree with depth >= 2 for is_ghost test")
+
+    tree_info, _ = _build_tree_info_pages(
+        batch_trees=[tree_seq], max_tree_height=max_tree_height, page_size=page_size, device=device
+    )
+
+    # Mark a key token (with position_id > 0) as ghost in tree_info word1.
+    ghost_idx = next(i for i, p in enumerate(tree_seq.position_id) if p > 0)
+    page = ghost_idx // page_size
+    entry = ghost_idx % page_size
+    tree_info_i64 = tree_info.to(torch.int64)
+    tree_info_i64[page, entry, 1] = tree_info_i64[page, entry, 1] | (1 << 30)
+    tree_info = tree_info_i64.to(torch.uint32)
+
+    custom_mask = _tree_mask_dense(
+        batch_trees=[tree_seq], max_tree_height=max_tree_height, device=device
+    ).view(1, seq_len, seq_len)
+    custom_mask[:, :, ghost_idx] = False
+    custom_mask = custom_mask.reshape(-1)
+
+    q = torch.randn((seq_len, num_qo_heads, head_dim), device=device, dtype=dtype)
+    k = torch.randn((seq_len, num_kv_heads, head_dim), device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    k_cache, v_cache = _pack_paged_kv_from_tokens(
+        k_tok=k, v_tok=v, batch_size=batch_size, seq_len=seq_len, page_size=page_size
+    )
+
+    qo_indptr = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    paged_kv_indices = torch.arange(1, device=device, dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([seq_len], device=device, dtype=torch.int32)
+
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
+    prefill.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        custom_mask=custom_mask,
+        pos_encoding_mode="NONE",
+    )
+    o_base = prefill.run(q, (k_cache, v_cache))
+
+    tree = flashinfer.BatchTreeWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
+    tree.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        tree_info,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=False,
+        pos_encoding_mode="NONE",
+        max_tree_height=max_tree_height,
+    )
+    o_tree = tree.run(q, (k_cache, v_cache))
 
     torch.testing.assert_close(o_tree, o_base, rtol=1e-3, atol=1e-3)
 
@@ -1005,7 +1107,7 @@ def test_batch_tree_mask_with_padding_tokens_in_last_page():
     batch_size = 2
     seq_len = 33
     page_size = 16  # last page has 1 token
-    anc_array_len = 9  # crosses a 4-byte packing boundary
+    max_tree_height = 10  # crosses a 4-byte packing boundary
     num_kv_heads = 4
     num_qo_heads = 8
 
@@ -1016,12 +1118,12 @@ def test_batch_tree_mask_with_padding_tokens_in_last_page():
     ]
     tree_info, pos_ids = _build_tree_info_pages(
         batch_trees=batch_trees,
-        anc_array_len=anc_array_len,
+        max_tree_height=max_tree_height,
         page_size=page_size,
         device=device,
     )
     custom_mask = _tree_mask_dense(
-        batch_trees=batch_trees, anc_array_len=anc_array_len, device=device
+        batch_trees=batch_trees, max_tree_height=max_tree_height, device=device
     )
 
     q = torch.randn((batch_size * seq_len, num_qo_heads, head_dim), device=device, dtype=dtype)
@@ -1094,15 +1196,16 @@ def test_batch_tree_mask_with_padding_tokens_in_last_page():
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        tree_info,
         num_qo_heads,
         num_kv_heads,
         head_dim,
         page_size,
         causal=False,
         pos_encoding_mode="ROPE_LLAMA",
-        anc_array_len=anc_array_len,
+        max_tree_height=max_tree_height,
     )
-    o_tree = tree.run(q, (k_cache_tree, v_cache), tree_info=tree_info)
+    o_tree = tree.run(q, (k_cache_tree, v_cache))
     torch.testing.assert_close(o_tree, o_base, rtol=1e-3, atol=1e-3)
 
 
@@ -1122,7 +1225,7 @@ def test_batch_tree_mask_structured_main_path_expected_mean():
     depth = 12  # diff spans 1..11 (crosses 4-byte packing boundaries at 4/5 and 8/9)
     seq_len = width * depth
     page_size = 7  # deliberately not dividing seq_len
-    anc_array_len = 13  # larger than depth-1 to exercise padding within the packed words
+    max_tree_height = 14  # larger than depth to exercise padding within packed words
     num_kv_heads = 1
     num_qo_heads = 1
 
@@ -1132,7 +1235,7 @@ def test_batch_tree_mask_structured_main_path_expected_mean():
     )
     tree_info, _ = _build_tree_info_pages(
         batch_trees=[tree_seq],
-        anc_array_len=anc_array_len,
+        max_tree_height=max_tree_height,
         page_size=page_size,
         device=device,
     )
@@ -1161,15 +1264,16 @@ def test_batch_tree_mask_structured_main_path_expected_mean():
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        tree_info,
         num_qo_heads,
         num_kv_heads,
         head_dim,
         page_size,
         causal=False,
         pos_encoding_mode="NONE",
-        anc_array_len=anc_array_len,
+        max_tree_height=max_tree_height,
     )
-    o = tree.run(q, (k_cache, v_cache), tree_info=tree_info)
+    o = tree.run(q, (k_cache, v_cache))
 
     # Check main-path queries at multiple levels, including around packing boundaries.
     check_levels = [0, 1, 4, 5, 8, 9, depth - 1]
@@ -1196,8 +1300,8 @@ def test_batch_tree_mask_structured_max_diff_truncates():
     depth = 12
     seq_len = width * depth
     page_size = 7
-    anc_array_len_storage = 13  # tree_info contains up to 13 diffs (padded past depth-1)
-    anc_array_len_runtime = 7  # kernel should only allow diff in [0, 7] (8 keys incl. self)
+    max_tree_height_storage = 14  # tree_info contains up to 13 diffs (padded past depth-1)
+    max_tree_height_runtime = 8  # kernel should only allow diff in [0, 7] (8 keys incl. self)
     num_kv_heads = 1
     num_qo_heads = 1
 
@@ -1207,7 +1311,7 @@ def test_batch_tree_mask_structured_max_diff_truncates():
     )
     tree_info, _ = _build_tree_info_pages(
         batch_trees=[tree_seq],
-        anc_array_len=anc_array_len_storage,
+        max_tree_height=max_tree_height_storage,
         page_size=page_size,
         device=device,
     )
@@ -1236,22 +1340,23 @@ def test_batch_tree_mask_structured_max_diff_truncates():
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        tree_info,
         num_qo_heads,
         num_kv_heads,
         head_dim,
         page_size,
         causal=False,
         pos_encoding_mode="NONE",
-        anc_array_len=anc_array_len_runtime,
+        max_tree_height=max_tree_height_runtime,
     )
-    o = tree.run(q, (k_cache, v_cache), tree_info=tree_info)
+    o = tree.run(q, (k_cache, v_cache))
 
-    # For a deep query on the main path, only the last `anc_array_len_runtime` ancestors plus
+    # For a deep query on the main path, only the last (max_tree_height_runtime - 1) ancestors plus
     # itself should remain.
     p = depth - 1
     inner = int(main_inner_by_pos[p])
     q_token_id = p * width + inner
-    start_level = max(0, p - anc_array_len_runtime)
+    start_level = max(0, p - (max_tree_height_runtime - 1))
     allowed_ids = [t * width + int(main_inner_by_pos[t]) for t in range(start_level, p + 1)]
     expected = float(sum(allowed_ids)) / float(len(allowed_ids))
     got = float(o[q_token_id, 0, 0].item())

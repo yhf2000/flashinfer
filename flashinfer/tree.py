@@ -255,8 +255,6 @@ def get_batch_tree_module(backend, *args):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
-        tree_info: torch.Tensor,
-        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -301,8 +299,6 @@ def get_batch_tree_module(backend, *args):
             q,
             paged_k_cache,
             paged_v_cache,
-            tree_info,
-            anc_array_len,
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
@@ -334,8 +330,6 @@ def get_batch_tree_module(backend, *args):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
-        tree_info: torch.Tensor,
-        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -469,8 +463,6 @@ def get_batch_tree_jit_module(module_name: str, jit_module: Any):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
-        tree_info: torch.Tensor,
-        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -489,8 +481,6 @@ def get_batch_tree_jit_module(module_name: str, jit_module: Any):
             q,
             paged_k_cache,
             paged_v_cache,
-            tree_info,
-            anc_array_len,
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
@@ -511,8 +501,6 @@ def get_batch_tree_jit_module(module_name: str, jit_module: Any):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
-        tree_info: torch.Tensor,
-        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -818,7 +806,8 @@ class BatchTreeWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
-        self._anc_array_len: Optional[int] = None
+        self._max_tree_height: Optional[int] = None
+        self._tree_info: Optional[torch.Tensor] = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -855,10 +844,12 @@ class BatchTreeWithPagedKVCacheWrapper:
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
+        tree_info: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim_qk: int,
         page_size: int,
+        max_tree_height: int,
         head_dim_vo: Optional[int] = None,
         custom_mask: Optional[torch.Tensor] = None,
         packed_custom_mask: Optional[torch.Tensor] = None,
@@ -885,7 +876,6 @@ class BatchTreeWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
-        anc_array_len: Optional[int] = None,
     ) -> None:
         r"""Plan batch tree/append attention on Paged KV-Cache for given problem specification.
 
@@ -1016,12 +1006,32 @@ class BatchTreeWithPagedKVCacheWrapper:
             raise NotImplementedError(
                 "BatchTree: only tree_mask is supported (no multi-item scoring mask)"
             )
-        if anc_array_len is None:
-            raise ValueError("anc_array_len must be provided for tree_mask")
-        if anc_array_len <= 0:
-            raise ValueError("anc_array_len must be > 0")
-        self._anc_array_len = int(anc_array_len)
-        self._tree_words_per_q = 1 + ((self._anc_array_len + 3) // 4)
+        if max_tree_height <= 0:
+            raise ValueError("max_tree_height must be >= 1")
+        self._max_tree_height = int(max_tree_height)
+        # TREE_WORDS_PER_Q = 1(word1) + ceil((MAX_TREE_HEIGHT-1)/4) packed ancestor words.
+        self._tree_words_per_q = 1 + ((self._max_tree_height - 1 + 3) // 4)
+        if tree_info.device != self.device:
+            raise ValueError("tree_info must be on the same device as the wrapper workspace")
+        if tree_info.dtype != torch.uint32:
+            raise ValueError("tree_info must be a torch.uint32 tensor")
+        if tree_info.ndim != 3:
+            raise ValueError(
+                "tree_info must be a 3-D tensor: [max_num_pages, page_size, MAX_SCHE_LEN]"
+            )
+        if tree_info.shape[1] != page_size:
+            raise ValueError(
+                "tree_info.shape[1] (page_size) must match paged_kv_cache page_size"
+            )
+        if tree_info.shape[2] < 2:
+            raise ValueError("tree_info.shape[2] (MAX_SCHE_LEN) must be >= 2")
+        # Need tree_info[0] + staged tree_info[1..TREE_WORDS_PER_Q]
+        if tree_info.shape[2] < (1 + self._tree_words_per_q):
+            raise ValueError(
+                "tree_info.shape[2] (MAX_SCHE_LEN) is insufficient for compiled TREE_WORDS_PER_Q"
+            )
+        # Keep a reference so the cached pointer remains valid after plan().
+        self._tree_info = tree_info
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -1238,6 +1248,8 @@ class BatchTreeWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim_qk,
                 head_dim_vo,
+                tree_info,
+                self._max_tree_height,
                 causal,
                 window_left,
             ]
@@ -1333,7 +1345,6 @@ class BatchTreeWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        tree_info: torch.Tensor,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch tree attention between query and paged kv-cache.
 
@@ -1391,31 +1402,11 @@ class BatchTreeWithPagedKVCacheWrapper:
         else:
             page_size = k_cache.shape[2]
 
+        if self._tree_info is None or self._max_tree_height is None:
+            raise RuntimeError("tree_info/max_tree_height is not set, please pass them in plan()")
+        tree_info = self._tree_info
         if tree_info.device != q.device:
-            raise ValueError("tree_info must be on the same device as q")
-        if tree_info.dtype != torch.uint32:
-            raise ValueError("tree_info must be a torch.uint32 tensor")
-        if tree_info.ndim != 3:
-            raise ValueError(
-                "tree_info must be a 3-D tensor: [max_num_pages, page_size, MAX_SCHE_LEN]"
-            )
-        if tree_info.shape[1] != page_size:
-            raise ValueError(
-                "tree_info.shape[1] (page_size) must match paged_kv_cache page_size"
-            )
-        if tree_info.shape[2] < 2:
-            raise ValueError("tree_info.shape[2] (MAX_SCHE_LEN) must be >= 2")
-        if self._anc_array_len is not None:
-            anc_words = (self._anc_array_len + 3) // 4
-            if anc_words > (self._tree_words_per_q - 1):
-                raise ValueError(
-                    "anc_array_len exceeds compiled TREE_WORDS_PER_Q capacity, please re-plan"
-                )
-            need_words = 1 + self._tree_words_per_q  # tree_info[0] + staged tree_info[1..]
-            if tree_info.shape[2] < need_words:
-                raise ValueError(
-                    "tree_info.shape[2] (MAX_SCHE_LEN) is insufficient for TREE_WORDS_PER_Q"
-                )
+            raise ValueError("tree_info (cached in plan) must be on the same device as q")
         window_left = self._window_left if window_left is None else window_left
         if self._backend != "trtllm-gen":
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
@@ -1476,9 +1467,6 @@ class BatchTreeWithPagedKVCacheWrapper:
         mask_mode = MaskMode.NON_CAUSAL.value
 
         assert self._plan_info is not None, "plan info is not initialized"
-        if self._anc_array_len is None:
-            raise RuntimeError("anc_array_len is not set, please pass it in plan()")
-
         run_args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -1486,8 +1474,6 @@ class BatchTreeWithPagedKVCacheWrapper:
             q,
             k_cache,
             v_cache,
-            tree_info,
-            self._anc_array_len,
             self._qo_indptr_buf,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,

@@ -182,10 +182,16 @@ __device__ __forceinline__ uint32_t get_warp_idx_q(const uint32_t tid_y = thread
   }
 }
 
-__device__ __forceinline__ uint32_t tree_info_is_delete(uint32_t packed) { return packed >> 31; }
+// tree_info[1] bit layout (uint32):
+// |   1 bit   |   1 bit   |   22 bits   |  8 bits  |
+// | is_delete | is_ghost  | position_id | inner_id |
+//
+// For masking, we treat (is_delete | is_ghost) != 0 as invalid.
+__device__ __forceinline__ uint32_t tree_info_invalid_flags(uint32_t packed) { return packed >> 30; }
+__device__ __forceinline__ bool tree_info_is_invalid(uint32_t packed) { return (packed >> 30) != 0; }
 __device__ __forceinline__ uint32_t tree_info_position_id(uint32_t packed) {
-  // [1 bit is_delete][23 bits position_id][8 bits inner_id]
-  return (packed >> 8) & ((1u << 23) - 1);
+  // [is_delete(1b)][is_ghost(1b)][position_id(22b)][inner_id(8b)]
+  return (packed >> 8) & ((1u << 22) - 1);
 }
 __device__ __forceinline__ uint32_t tree_info_inner_id(uint32_t packed) { return packed & 0xFFu; }
 
@@ -743,10 +749,11 @@ __device__ __forceinline__ void logits_mask_tree(
   const uint32_t lane_idx = tid.x;
   // This is the only supported masking path for tree attention kernels.
   // `tree_info` format (uint32 words per token, paged like KV-cache):
-  //   tree_info[0]: [is_build(1b) | token_ids(31b)]               (not used in attention)
-  //   tree_info[1]: [is_delete(1b) | position_id(23b) | inner_id(8b)]
+  //   tree_info[0]: [is_build(1b) | token_ids(31b)]                       (not used in attention)
+  //   tree_info[1]: [is_delete(1b) | is_ghost(1b) | position_id(22b) | inner_id(8b)]
   //   tree_info[2..]: each word packs 4 ancestor inner_id bytes:
-  //     [anc0(8b) | anc1(8b) | anc2(8b) | anc3(8b)] ... up to `anc_array_len` entries
+  //     [anc0(8b) | anc1(8b) | anc2(8b) | anc3(8b)] ... up to (MAX_TREE_HEIGHT - 1) entries,
+  //     padded to 4 bytes.
   //
   // Q-side shared memory (`q_tree_smem`) stores tree_info[1..] for each packed Q row:
   //   q_words[0] is tree_info[1], q_words[1] is tree_info[2], ...
@@ -755,10 +762,10 @@ __device__ __forceinline__ void logits_mask_tree(
   // CTA_TILE_KV tile.
   //
   // Mask rules (as requested):
-  // 1) kv.is_delete == 1 => false
+  // 1) (kv.is_delete | kv.is_ghost) != 0 => false
   // 2) kv.position_id > q.position_id => false
   // 3) diff = q_pos - kv_pos
-  //    if diff > anc_array_len => false
+  //    if diff > (MAX_TREE_HEIGHT - 1) => false
   //    if diff == 0 => kv_inner == q_inner
   //    else:
   //      diff_slot = diff - 1
@@ -768,13 +775,10 @@ __device__ __forceinline__ void logits_mask_tree(
   // Notes on implementation:
   // - Only prefetch q_word1 (do not precompute q_pos/q_inner; derive them on demand).
   // - Do NOT call variant.LogitsMask: tree kernels only support tree_mask here.
-  // - anc_array_len is guaranteed > 0 (ancestor array always exists).
   // - Use an early-exit branch for `diff > max_diff` (expected common case).
 
-  // Number of valid ancestor entries (uint8 inner_id) per token.
-  // This drives max distance in position_id space:
-  //   max_diff = anc_array_len   (corresponds to `(MAX_SCHE_LEN - 2) * 4` in the original rule)
-  const uint32_t max_diff = params.anc_array_len;
+  // Maximum distance in position_id space.
+  const uint32_t max_diff = params.max_tree_height - 1;
 
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
@@ -820,8 +824,8 @@ __device__ __forceinline__ void logits_mask_tree(
         const uint32_t kv_local = kv_idx - tile_kv_start;
         const uint32_t kv_word1 = kv_tree_smem[kv_local];
 
-        // Rule 1: is_delete => false.
-        if (tree_info_is_delete(kv_word1)) {
+        // Rule 1: invalid flags => false.
+        if (tree_info_is_invalid(kv_word1)) {
           s_frag[mma_q][mma_kv][reg_id] = KTraits::MaskFillValue;
           continue;
         }
@@ -1422,15 +1426,8 @@ __device__ __forceinline__ void BatchTreeWithPagedKVCacheDevice(
     cp_async::commit_group();
 
     // Tree kernels always require tree_info and always apply tree_mask.
-    // Kernel is compiled with a fixed `TREE_WORDS_PER_Q` (JIT parameter).
-    // Each token needs:
-    // - 1 word for tree_info[1] (pos/inner/delete)
-    // - ceil(anc_array_len / 4) words for packed ancestor bytes from tree_info[2..]
-    // The runtime anc_array_len must fit in the compiled capacity.
-    constexpr uint32_t tree_words_per_q = KTraits::TREE_WORDS_PER_Q;
-    const uint32_t anc_words = (params.anc_array_len + 3) / 4;
-    (void)tree_words_per_q;
-    (void)anc_words;
+    // Kernel is compiled with a fixed `TREE_WORDS_PER_Q` (JIT parameter), derived from
+    // MAX_TREE_HEIGHT at plan/JIT time.
     // Overlap q_tree_info global loads with in-flight Q cp.async.
     load_q_tree_info_smem<KTraits>(params, request_idx, qo_tile_idx, qo_len, kv_len, group_size,
                                    smem_storage.q_tree_smem, tid);

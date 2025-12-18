@@ -24,13 +24,13 @@ Array<int64_t> BatchTreeWithKVCachePlan(
     TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
     TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
+    int64_t head_dim_vo, TensorView tree_info, int64_t max_tree_height, bool causal,
+    int64_t window_left, int64_t fixed_split_size,
     bool disable_split_kv, int64_t num_colocated_ctas);
 
 void BatchTreeWithPagedKVCacheRun(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
                                  Array<int64_t> plan_info_vec, TensorView q, TensorView paged_k_cache,
-                                 TensorView paged_v_cache, TensorView tree_info,
-                                 int64_t anc_array_len,
+                                 TensorView paged_v_cache,
                                  TensorView qo_indptr,
                                  TensorView paged_kv_indptr, TensorView paged_kv_indices,
                                  TensorView paged_kv_last_page_len, TensorView o,

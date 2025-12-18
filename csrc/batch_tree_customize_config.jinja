@@ -27,8 +27,9 @@ constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
 constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
 // Number of uint32 words per packed Q row staged for tree_mask:
 // - word0 in tree_info is unused in attention (is_build/token_id)
-// - we stage tree_info[1..] (pos/inner/delete + packed ancestor bytes)
-// This is compiled as a constant for performance (JIT parameter).
+// - we stage tree_info[1..] (flags+pos+inner + packed ancestor bytes)
+// This is compiled as a constant for performance (JIT parameter), derived from MAX_TREE_HEIGHT:
+//   TREE_WORDS_PER_Q = 1 + ceil((MAX_TREE_HEIGHT - 1) / 4)
 constexpr int TREE_WORDS_PER_Q = {{ tree_words_per_q }};
 constexpr bool USE_FP16_QK_REDUCTION = {{ use_fp16_qk_reduction }};
 constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
@@ -49,9 +50,10 @@ struct PagedParams {
   int64_t tree_info_stride_entry;
   int64_t tree_info_stride_word;
   uint32_t tree_info_sche_len;
-  // Number of valid ancestor inner_id entries per token.
-  // Note: this is NOT necessarily (tree_info_sche_len - 2) * 4.
-  uint32_t anc_array_len;
+  // Maximum tree height (in position_id space). The runtime mask allows:
+  //   diff = q_pos - kv_pos in [0, max_tree_height - 1]
+  // while the ancestor bytes are staged up to TREE_WORDS_PER_Q (padded to 4 bytes).
+  uint32_t max_tree_height;
   IdType* q_indptr;
   DTypeO* o;
   float* lse;
