@@ -89,6 +89,7 @@ def get_customize_batch_tree_module(
     idtype: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    tree_words_per_q: int,
     additional_tensor_names: List[str],
     additional_tensor_dtypes: List[str],
     additional_scalar_names: List[str],
@@ -110,6 +111,7 @@ def get_customize_batch_tree_module(
         idtype,
         head_dim_qk,
         head_dim_vo,
+        tree_words_per_q,
         additional_tensor_names,
         additional_tensor_dtypes,
         additional_scalar_names,
@@ -253,6 +255,8 @@ def get_batch_tree_module(backend, *args):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
+        tree_info: torch.Tensor,
+        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -297,6 +301,8 @@ def get_batch_tree_module(backend, *args):
             q,
             paged_k_cache,
             paged_v_cache,
+            tree_info,
+            anc_array_len,
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
@@ -328,6 +334,8 @@ def get_batch_tree_module(backend, *args):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
+        tree_info: torch.Tensor,
+        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -461,6 +469,8 @@ def get_batch_tree_jit_module(module_name: str, jit_module: Any):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
+        tree_info: torch.Tensor,
+        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -479,6 +489,8 @@ def get_batch_tree_jit_module(module_name: str, jit_module: Any):
             q,
             paged_k_cache,
             paged_v_cache,
+            tree_info,
+            anc_array_len,
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
@@ -499,6 +511,8 @@ def get_batch_tree_jit_module(module_name: str, jit_module: Any):
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
+        tree_info: torch.Tensor,
+        anc_array_len: int,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
@@ -804,6 +818,7 @@ class BatchTreeWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._anc_array_len: Optional[int] = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -870,6 +885,7 @@ class BatchTreeWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        anc_array_len: Optional[int] = None,
     ) -> None:
         r"""Plan batch tree/append attention on Paged KV-Cache for given problem specification.
 
@@ -992,6 +1008,20 @@ class BatchTreeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if causal:
+            raise NotImplementedError("BatchTree: only tree_mask is supported (no causal mask)")
+        if custom_mask is not None or packed_custom_mask is not None:
+            raise NotImplementedError("BatchTree: only tree_mask is supported (no custom mask)")
+        if prefix_len_ptr is not None:
+            raise NotImplementedError(
+                "BatchTree: only tree_mask is supported (no multi-item scoring mask)"
+            )
+        if anc_array_len is None:
+            raise ValueError("anc_array_len must be provided for tree_mask")
+        if anc_array_len <= 0:
+            raise ValueError("anc_array_len must be > 0")
+        self._anc_array_len = int(anc_array_len)
+        self._tree_words_per_q = 1 + ((self._anc_array_len + 3) // 4)
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -1151,6 +1181,7 @@ class BatchTreeWithPagedKVCacheWrapper:
                     paged_kv_indptr.dtype,
                     head_dim_qk,
                     head_dim_vo,
+                    self._tree_words_per_q,
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1302,6 +1333,7 @@ class BatchTreeWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        tree_info: torch.Tensor,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch tree attention between query and paged kv-cache.
 
@@ -1358,6 +1390,32 @@ class BatchTreeWithPagedKVCacheWrapper:
             page_size = k_cache.shape[1]
         else:
             page_size = k_cache.shape[2]
+
+        if tree_info.device != q.device:
+            raise ValueError("tree_info must be on the same device as q")
+        if tree_info.dtype != torch.uint32:
+            raise ValueError("tree_info must be a torch.uint32 tensor")
+        if tree_info.ndim != 3:
+            raise ValueError(
+                "tree_info must be a 3-D tensor: [max_num_pages, page_size, MAX_SCHE_LEN]"
+            )
+        if tree_info.shape[1] != page_size:
+            raise ValueError(
+                "tree_info.shape[1] (page_size) must match paged_kv_cache page_size"
+            )
+        if tree_info.shape[2] < 2:
+            raise ValueError("tree_info.shape[2] (MAX_SCHE_LEN) must be >= 2")
+        if self._anc_array_len is not None:
+            anc_words = (self._anc_array_len + 3) // 4
+            if anc_words > (self._tree_words_per_q - 1):
+                raise ValueError(
+                    "anc_array_len exceeds compiled TREE_WORDS_PER_Q capacity, please re-plan"
+                )
+            need_words = 1 + self._tree_words_per_q  # tree_info[0] + staged tree_info[1..]
+            if tree_info.shape[2] < need_words:
+                raise ValueError(
+                    "tree_info.shape[2] (MAX_SCHE_LEN) is insufficient for TREE_WORDS_PER_Q"
+                )
         window_left = self._window_left if window_left is None else window_left
         if self._backend != "trtllm-gen":
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
@@ -1407,18 +1465,20 @@ class BatchTreeWithPagedKVCacheWrapper:
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
 
+        # Tree kernels only support tree_mask driven by tree_info.
         if self._custom_mask_buf is not None:
-            mask_mode = MaskMode.CUSTOM.value
-        else:
-            if self._causal:
-                mask_mode = MaskMode.CAUSAL.value
-            else:
-                mask_mode = MaskMode.NON_CAUSAL.value
-
+            raise NotImplementedError("BatchTree: custom_mask is not supported with tree_mask")
         if self._prefix_len_ptr is not None:
-            mask_mode = MaskMode.MULTIITEMSCORING.value
+            raise NotImplementedError("BatchTree: multi-item scoring mask is not supported with tree_mask")
+        # Ignore/forbid causal flag: causality is encoded in tree_info (position_id).
+        if self._causal:
+            raise NotImplementedError("BatchTree: causal flag is not supported with tree_mask")
+        mask_mode = MaskMode.NON_CAUSAL.value
 
         assert self._plan_info is not None, "plan info is not initialized"
+        if self._anc_array_len is None:
+            raise RuntimeError("anc_array_len is not set, please pass it in plan()")
+
         run_args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -1426,6 +1486,8 @@ class BatchTreeWithPagedKVCacheWrapper:
             q,
             k_cache,
             v_cache,
+            tree_info,
+            self._anc_array_len,
             self._qo_indptr_buf,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
@@ -1518,4 +1580,3 @@ class BatchTreeWithPagedKVCacheWrapper:
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
         pass
-

@@ -44,13 +44,6 @@
 #include "variants.cuh"
 namespace flashinfer {
 
-DEFINE_HAS_MEMBER(maybe_q_rope_offset)
-DEFINE_HAS_MEMBER(maybe_k_rope_offset)
-DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
-DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
-DEFINE_HAS_MEMBER(token_pos_in_items_len)
-DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
-
 namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
@@ -78,7 +71,8 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 }
 
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
-          uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO>
+          uint32_t HEAD_DIM_VO, uint32_t TREE_WORDS_PER_Q, typename DTypeQ, typename DTypeKV,
+          typename DTypeO>
 struct SharedStorageQKVO {
   union {
     struct {
@@ -95,16 +89,25 @@ struct SharedStorageQKVO {
     };
     alignas(16) DTypeO smem_o[CTA_TILE_Q * HEAD_DIM_VO];
   };
+  // Tree metadata staging (uint32 words), kept outside the union:
+  // - These buffers must stay alive throughout the kernel, so they cannot be overlaid with Q/K/V
+  //   smem or the CTA sync scratchpad.
+  // - `q_tree_smem` stores tree_info[1..] for each packed Q row in this CTA tile.
+  // - `kv_tree_smem` stores tree_info[1] for each KV token in the current CTA_TILE_KV tile.
+  alignas(16) uint32_t q_tree_smem[CTA_TILE_Q * TREE_WORDS_PER_Q];
+  alignas(16) uint32_t kv_tree_smem[CTA_TILE_KV];
 };
 
-template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_,
-          uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
+template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t TREE_WORDS_PER_Q_,
+          uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_, uint32_t NUM_MMA_D_QK_,
+          uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
           uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
           typename AttentionVariant_>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
+  static constexpr uint32_t TREE_WORDS_PER_Q = TREE_WORDS_PER_Q_;
   static constexpr uint32_t NUM_MMA_Q = NUM_MMA_Q_;
   static constexpr uint32_t NUM_MMA_KV = NUM_MMA_KV_;
   static constexpr uint32_t NUM_MMA_D_QK = NUM_MMA_D_QK_;
@@ -144,8 +147,9 @@ struct KernelTraits {
             (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
   }
 
-  using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
-                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
+  using SharedStorage =
+      SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO,
+                        TREE_WORDS_PER_Q, DTypeQ, DTypeKV, DTypeO>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -178,6 +182,80 @@ __device__ __forceinline__ uint32_t get_warp_idx_q(const uint32_t tid_y = thread
   }
 }
 
+__device__ __forceinline__ uint32_t tree_info_is_delete(uint32_t packed) { return packed >> 31; }
+__device__ __forceinline__ uint32_t tree_info_position_id(uint32_t packed) {
+  // [1 bit is_delete][23 bits position_id][8 bits inner_id]
+  return (packed >> 8) & ((1u << 23) - 1);
+}
+__device__ __forceinline__ uint32_t tree_info_inner_id(uint32_t packed) { return packed & 0xFFu; }
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ uint32_t load_tree_info_word(const Params& params,
+                                                        const typename KTraits::IdType page_id,
+                                                        const uint32_t entry_idx,
+                                                        const uint32_t word_idx) {
+  // tree_info: [max_num_pages, page_size, MAX_SCHE_LEN] in uint32 elements.
+  return __ldg(params.tree_info + static_cast<int64_t>(page_id) * params.tree_info_stride_page +
+               static_cast<int64_t>(entry_idx) * params.tree_info_stride_entry +
+               static_cast<int64_t>(word_idx) * params.tree_info_stride_word);
+}
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void load_q_tree_info_smem(
+    const Params& params, const uint32_t request_idx, const uint32_t qo_tile_idx,
+    const uint32_t qo_len, const uint32_t kv_len, const uint_fastdiv group_size,
+    uint32_t* __restrict__ q_tree_smem, const dim3 tid = threadIdx) {
+  static_assert(KTraits::TREE_WORDS_PER_Q > 0);
+  constexpr uint32_t words_per_q = KTraits::TREE_WORDS_PER_Q;
+  const uint32_t tid_linear =
+      tid.x + WARP_SIZE * (tid.y + KTraits::NUM_WARPS_Q * tid.z);  // NUM_THREADS
+  const uint32_t tile_q_packed_start = qo_tile_idx * KTraits::CTA_TILE_Q;
+  const uint32_t total_words = KTraits::CTA_TILE_Q * words_per_q;
+  const typename KTraits::IdType seq_page_start = params.paged_kv.indptr[request_idx];
+#pragma unroll 1
+  for (uint32_t linear = tid_linear; linear < total_words; linear += KTraits::NUM_THREADS) {
+    const uint32_t packed_row = linear / words_per_q;
+    const uint32_t word_off = linear - packed_row * words_per_q;  // 0..words_per_q-1
+    const uint32_t qo_packed_idx = tile_q_packed_start + packed_row;
+    uint32_t q_idx = 0, r = 0;
+    group_size.divmod(qo_packed_idx, q_idx, r);
+    uint32_t out = 0;
+    if (q_idx < qo_len) {
+      const int32_t idx_in_kv = int32_t(q_idx) + int32_t(kv_len) - int32_t(qo_len);
+      if (idx_in_kv >= 0 && static_cast<uint32_t>(idx_in_kv) < kv_len) {
+        uint32_t page_in_seq = 0, entry_idx = 0;
+        params.paged_kv.page_size.divmod(static_cast<uint32_t>(idx_in_kv), page_in_seq, entry_idx);
+        const typename KTraits::IdType page_iter = seq_page_start + page_in_seq;
+        const typename KTraits::IdType page_id = __ldg(params.paged_kv.indices + page_iter);
+        // Skip tree_info[0]; word_off 0 maps to tree_info[1].
+        out = load_tree_info_word<KTraits>(params, page_id, entry_idx, 1 + word_off);
+      }
+    }
+    q_tree_smem[linear] = out;
+  }
+}
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void load_kv_tree_word1_smem(
+    const Params& params, const uint32_t request_idx, const uint32_t tile_kv_start,
+    const uint32_t chunk_end, uint32_t* __restrict__ kv_tree_smem, const dim3 tid = threadIdx) {
+  const uint32_t tid_linear = tid.x + WARP_SIZE * (tid.y + KTraits::NUM_WARPS_Q * tid.z);
+  const typename KTraits::IdType seq_page_start = params.paged_kv.indptr[request_idx];
+#pragma unroll 1
+  for (uint32_t local = tid_linear; local < KTraits::CTA_TILE_KV; local += KTraits::NUM_THREADS) {
+    const uint32_t kv_idx = tile_kv_start + local;
+    uint32_t out = 0;
+    if (kv_idx < chunk_end) {
+      uint32_t page_in_seq = 0, entry_idx = 0;
+      params.paged_kv.page_size.divmod(kv_idx, page_in_seq, entry_idx);
+      const typename KTraits::IdType page_iter = seq_page_start + page_in_seq;
+      const typename KTraits::IdType page_id = __ldg(params.paged_kv.indices + page_iter);
+      out = load_tree_info_word<KTraits>(params, page_id, entry_idx, /*word_idx=*/1);
+    }
+    kv_tree_smem[local] = out;
+  }
+}
+
 template <typename KTraits>
 __device__ __forceinline__ uint32_t get_warp_idx_kv(const uint32_t tid_z = threadIdx.z) {
   if constexpr (KTraits::NUM_WARPS_KV == 1) {
@@ -199,64 +277,24 @@ __device__ __forceinline__ uint32_t get_warp_idx(const uint32_t tid_y = threadId
  * \param x_first_half First fragment x[offset:offset+16, j*16:(j+1)*16]
  * \param x_second_half Second fragment x[offset:offset*16, j*16+d/2:(j+1)*16+d/2]
  * \param rope_freq Rope frequency
- * \param offset The offset of the first row in both fragments.
  * \note The sin/cos computation is slow, especially for A100 GPUs which has low
  *   non tensor-ops flops, will optimize in the future.
  */
 template <typename T>
-__device__ __forceinline__ void k_frag_apply_llama_rope(T* x_first_half, T* x_second_half,
-                                                        const float* rope_freq,
-                                                        const uint32_t kv_offset) {
+__device__ __forceinline__ void k_frag_apply_llama_rope_with_pos(const float* rope_freq,
+                                                                 const uint32_t kv_pos0,
+                                                                 const uint32_t kv_pos1,
+                                                                 T* x_first_half,
+                                                                 T* x_second_half) {
   static_assert(sizeof(T) == 2);
+  const float pos[2] = {static_cast<float>(kv_pos0), static_cast<float>(kv_pos1)};
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos, sin, tmp;
     // 0 1 | 2 3
     // ---------
     // 4 5 | 6 7
-    uint32_t i = reg_id / 4, j = (reg_id % 4) / 2;
-    __sincosf(float(kv_offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin, &cos);
-    tmp = x_first_half[reg_id];
-    x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin);
-    x_second_half[reg_id] = ((float)x_second_half[reg_id] * cos + tmp * sin);
-  }
-}
-
-template <typename T>
-__device__ __forceinline__ void q_frag_apply_llama_rope(T* x_first_half, T* x_second_half,
-                                                        const float* rope_freq,
-                                                        const uint32_t qo_packed_offset,
-                                                        const uint_fastdiv group_size) {
-#pragma unroll
-  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-    float cos, sin, tmp;
-    // 0 1 | 4 5
-    // ---------
-    // 2 3 | 6 7
-    uint32_t i = ((reg_id % 4) / 2), j = (reg_id / 4);
-    __sincosf(float((qo_packed_offset + 8 * i) / group_size) * rope_freq[2 * j + reg_id % 2], &sin,
-              &cos);
-    tmp = x_first_half[reg_id];
-    x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin);
-    x_second_half[reg_id] = ((float)x_second_half[reg_id] * cos + tmp * sin);
-  }
-}
-
-template <typename T, typename IdType>
-__device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half, T* x_second_half,
-                                                                 const float* rope_freq,
-                                                                 const uint32_t qo_packed_offset,
-                                                                 const uint_fastdiv group_size,
-                                                                 const IdType* q_rope_offset) {
-  float pos[2] = {static_cast<float>(q_rope_offset[qo_packed_offset / group_size]),
-                  static_cast<float>(q_rope_offset[(qo_packed_offset + 8) / group_size])};
-#pragma unroll
-  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-    float cos, sin, tmp;
-    // 0 1 | 4 5
-    // ---------
-    // 2 3 | 6 7
-    uint32_t i = ((reg_id % 4) / 2), j = (reg_id / 4);
+    const uint32_t i = reg_id / 4, j = (reg_id % 4) / 2;
     __sincosf(pos[i] * rope_freq[2 * j + reg_id % 2], &sin, &cos);
     tmp = x_first_half[reg_id];
     x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin);
@@ -264,66 +302,25 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half
   }
 }
 
-/*!
- * \brief Produce k/v fragments from global memory to shared memory.
- * \tparam fill_mode The fill mode of the shared memory.
- * \tparam NUM_MMA_D_VO The number of fragments in y dimension.
- * \tparam NUM_MMA_KV The number of fragments in z dimension.
- * \tparam num_warps The number of warps in the threadblock.
- * \tparam T The data type of the input tensor.
- * \param smem The shared memory to store kv fragments.
- * \param gptr The global memory pointer.
- * \param kv_idx_base The base kv index.
- * \param kv_len The length of kv tensor.
- */
-template <bool produce_v, SharedMemFillMode fill_mode, typename KTraits>
-__device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem,
-                                           uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
-                                           const uint32_t stride_n, const uint32_t kv_idx_base,
-                                           const uint32_t kv_len, const dim3 tid = threadIdx) {
-  // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
-  using DTypeKV = typename KTraits::DTypeKV;
-  constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
-  constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
-  constexpr uint32_t NUM_MMA_D = produce_v ? KTraits::NUM_MMA_D_VO : KTraits::NUM_MMA_D_QK;
-  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
-  constexpr uint32_t UPCAST_STRIDE =
-      produce_v ? KTraits::UPCAST_STRIDE_V : KTraits::UPCAST_STRIDE_K;
-  const uint32_t warp_idx = get_warp_idx<KTraits>(tid.y, tid.z), lane_idx = tid.x;
-
-  if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
-    uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
-    // NOTE: NUM_MMA_KV * 4 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 4 / num_warps
-    static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
+template <typename T>
+__device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(const float* rope_freq,
+                                                                 const uint32_t q_pos0,
+                                                                 const uint32_t q_pos1,
+                                                                 T* x_first_half,
+                                                                 T* x_second_half) {
+  static_assert(sizeof(T) == 2);
+  const float pos[2] = {static_cast<float>(q_pos0), static_cast<float>(q_pos1)};
 #pragma unroll
-    for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
-#pragma unroll
-      for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DTypeKV)); ++j) {
-        smem.template load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
-        *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
-        *gptr += 8 * upcast_size<DTypeKV>();
-      }
-      kv_idx += NUM_WARPS * 4;
-      *smem_offset =
-          smem.template advance_offset_by_row<NUM_WARPS * 4, UPCAST_STRIDE>(*smem_offset) -
-          sizeof(DTypeKV) * NUM_MMA_D;
-      *gptr += NUM_WARPS * 4 * stride_n - sizeof(DTypeKV) * NUM_MMA_D * upcast_size<DTypeKV>();
-    }
-    *smem_offset -= CTA_TILE_KV * UPCAST_STRIDE;
-  } else {
-    uint32_t kv_idx = kv_idx_base + warp_idx * 8 + lane_idx / 4;
-    // NOTE: NUM_MMA_KV * 2 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 2 / num_warps
-    static_assert(NUM_MMA_KV * 2 % NUM_WARPS_Q == 0);
-#pragma unroll
-    for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
-      smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
-      *smem_offset =
-          smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_STRIDE>(*smem_offset);
-      kv_idx += NUM_WARPS * 8;
-      *gptr += NUM_WARPS * 8 * stride_n;
-    }
-    *smem_offset -= KTraits::CTA_TILE_KV * UPCAST_STRIDE;
+  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+    float cos, sin, tmp;
+    // 0 1 | 4 5
+    // ---------
+    // 2 3 | 6 7
+    const uint32_t i = ((reg_id % 4) / 2), j = (reg_id / 4);
+    __sincosf(pos[i] * rope_freq[2 * j + reg_id % 2], &sin, &cos);
+    tmp = x_first_half[reg_id];
+    x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin);
+    x_second_half[reg_id] = ((float)x_second_half[reg_id] * cos + tmp * sin);
   }
 }
 
@@ -468,17 +465,28 @@ __device__ __forceinline__ void load_q_global_smem(
 }
 
 template <typename KTraits>
-__device__ __forceinline__ void q_smem_inplace_apply_rotary(
-    const uint32_t q_packed_idx, const uint32_t qo_len, const uint32_t kv_len,
-    const uint_fastdiv group_size, smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem,
+__device__ __forceinline__ void q_smem_inplace_apply_rotary_tree(
+    const uint32_t q_packed_idx_base, const uint32_t tile_q_packed_start,
+    const uint32_t* __restrict__ q_tree_smem, smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem,
     uint32_t* q_smem_offset_r, float (*rope_freq)[4], const dim3 tid = threadIdx) {
   if (get_warp_idx_kv<KTraits>(tid.z) == 0) {
     constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
+    constexpr uint32_t TREE_WORDS_PER_Q = KTraits::TREE_WORDS_PER_Q;
     const uint32_t lane_idx = tid.x;
     uint32_t q_frag_local[2][4];
     static_assert(KTraits::NUM_MMA_D_QK % 4 == 0, "NUM_MMA_D_QK must be a multiple of 4");
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      // Two-row selector within the fragment uses rows at offsets {0, 8} from the row base.
+      const uint32_t qo_packed_idx0 = q_packed_idx_base + mma_q * 16 + lane_idx / 4;
+      const uint32_t qo_packed_idx1 = qo_packed_idx0 + 8;
+      const uint32_t q_local0 = qo_packed_idx0 - tile_q_packed_start;
+      const uint32_t q_local1 = qo_packed_idx1 - tile_q_packed_start;
+      const uint32_t q_word1_0 = q_tree_smem[q_local0 * TREE_WORDS_PER_Q];
+      const uint32_t q_word1_1 = q_tree_smem[q_local1 * TREE_WORDS_PER_Q];
+      const uint32_t q_pos0 = tree_info_position_id(q_word1_0);
+      const uint32_t q_pos1 = tree_info_position_id(q_word1_1);
+
       uint32_t q_smem_offset_r_first_half = *q_smem_offset_r;
 #pragma unroll
       for (uint32_t mma_di = 0; mma_di < KTraits::NUM_MMA_D_QK / 2; ++mma_di) {
@@ -487,11 +495,9 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary(
             q_smem->template advance_offset_by_column<KTraits::NUM_MMA_D_QK>(
                 q_smem_offset_r_first_half, 0);
         q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
-        q_frag_apply_llama_rope<typename KTraits::DTypeQ>(
-            (typename KTraits::DTypeQ*)q_frag_local[0], (typename KTraits::DTypeQ*)q_frag_local[1],
-            rope_freq[mma_di],
-            q_packed_idx + kv_len * group_size - qo_len * group_size + mma_q * 16 + lane_idx / 4,
-            group_size);
+        q_frag_apply_llama_rope_with_pos<typename KTraits::DTypeQ>(
+            rope_freq[mma_di], q_pos0, q_pos1, (typename KTraits::DTypeQ*)q_frag_local[0],
+            (typename KTraits::DTypeQ*)q_frag_local[1]);
         q_smem->stmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
         q_smem->stmatrix_m8n8x4(q_smem_offset_r_first_half, q_frag_local[0]);
         q_smem_offset_r_first_half =
@@ -504,44 +510,10 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary(
 }
 
 template <typename KTraits>
-__device__ __forceinline__ void q_smem_inplace_apply_rotary_with_pos(
-    const uint32_t q_packed_idx_base, const typename KTraits::IdType* q_rope_offset,
-    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, const uint_fastdiv group_size,
-    uint32_t* q_smem_offset_r, float (*rope_freq)[4], const dim3 tid = threadIdx) {
-  if (get_warp_idx_kv<KTraits>(tid.z) == 0) {
-    constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
-    const uint32_t lane_idx = tid.x;
-    uint32_t q_frag_local[2][4];
-    static_assert(KTraits::NUM_MMA_D_QK % 4 == 0, "NUM_MMA_D_QK must be a multiple of 4");
-#pragma unroll
-    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-      uint32_t q_smem_offset_r_first_half = *q_smem_offset_r;
-#pragma unroll
-      for (uint32_t mma_di = 0; mma_di < KTraits::NUM_MMA_D_QK / 2; ++mma_di) {
-        q_smem->ldmatrix_m8n8x4(q_smem_offset_r_first_half, q_frag_local[0]);
-        uint32_t q_smem_offset_r_last_half =
-            q_smem->template advance_offset_by_column<KTraits::NUM_MMA_D_QK>(
-                q_smem_offset_r_first_half, 0);
-        q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
-        q_frag_apply_llama_rope_with_pos<typename KTraits::DTypeQ, typename KTraits::IdType>(
-            (typename KTraits::DTypeQ*)q_frag_local[0], (typename KTraits::DTypeQ*)q_frag_local[1],
-            rope_freq[mma_di], q_packed_idx_base + mma_q * 16 + lane_idx / 4, group_size,
-            q_rope_offset);
-        q_smem->stmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
-        q_smem->stmatrix_m8n8x4(q_smem_offset_r_first_half, q_frag_local[0]);
-        q_smem_offset_r_first_half =
-            q_smem->template advance_offset_by_column<2>(q_smem_offset_r_first_half, mma_di);
-      }
-      *q_smem_offset_r += 16 * UPCAST_STRIDE_Q;
-    }
-    *q_smem_offset_r -= KTraits::NUM_MMA_Q * 16 * UPCAST_STRIDE_Q;
-  }
-}
-
-template <typename KTraits>
-__device__ __forceinline__ void k_smem_inplace_apply_rotary(
-    const uint32_t kv_idx_base, smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r,
-    float (*rope_freq)[4], const dim3 tid = threadIdx) {
+__device__ __forceinline__ void k_smem_inplace_apply_rotary_tree(
+    const uint32_t tile_kv_start, const uint32_t* __restrict__ kv_tree_smem,
+    smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r, float (*rope_freq)[4],
+    const dim3 tid = threadIdx) {
   using DTypeKV = typename KTraits::DTypeKV;
   static_assert(sizeof(DTypeKV) == 2);
   constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;
@@ -550,26 +522,28 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
   if constexpr (KTraits::NUM_MMA_D_QK == 4 && KTraits::NUM_WARPS_Q == 4) {
     static_assert(KTraits::NUM_WARPS_KV == 1);
     const uint32_t warp_idx = get_warp_idx_q<KTraits>(tid.y);
-    // horizontal-axis: y
-    // vertical-axis: z
-    //         | 1-16       | 16-32      | 32-48      | 48-64      |
-    // | 1-16  | warp_idx=0 | warp_idx=1 | warp_idx=0 | warp_idx=1 |
-    // | 16-32 | warp_idx=2 | warp_idx=3 | warp_idx=2 | warp_idx=3 |
     static_assert(KTraits::NUM_MMA_KV % 2 == 0,
                   "when NUM_MMA_D_QK == 4, NUM_MMA_KV must be a multiple of 2");
-    uint32_t kv_idx = kv_idx_base + (warp_idx / 2) * 16 + lane_idx / 4;
+    uint32_t kv_idx = tile_kv_start + (warp_idx / 2) * 16 + lane_idx / 4;
     *k_smem_offset_r =
         (*k_smem_offset_r ^ (0x2 * (warp_idx % 2))) + (warp_idx / 2) * 16 * UPCAST_STRIDE_K;
 #pragma unroll
     for (uint32_t i = 0; i < KTraits::NUM_MMA_KV / 2; ++i) {
+      const uint32_t kv_local0 = kv_idx - tile_kv_start;
+      const uint32_t kv_word1_0 = kv_tree_smem[kv_local0];
+      const uint32_t kv_word1_1 = kv_tree_smem[kv_local0 + 8];
+      const uint32_t kv_pos0 = tree_info_position_id(kv_word1_0);
+      const uint32_t kv_pos1 = tree_info_position_id(kv_word1_1);
+
       uint32_t k_smem_offset_r_first_half = *k_smem_offset_r;
-      uint32_t mma_di = (warp_idx % 2);
+      const uint32_t mma_di = (warp_idx % 2);
       k_smem->ldmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
       uint32_t k_smem_offset_r_last_half =
           k_smem->template advance_offset_by_column<4>(k_smem_offset_r_first_half, 0);
       k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
-      k_frag_apply_llama_rope<DTypeKV>((DTypeKV*)k_frag_local[0], (DTypeKV*)k_frag_local[1],
-                                       rope_freq[mma_di], kv_idx);
+      k_frag_apply_llama_rope_with_pos<DTypeKV>(rope_freq[mma_di], kv_pos0, kv_pos1,
+                                               (DTypeKV*)k_frag_local[0],
+                                               (DTypeKV*)k_frag_local[1]);
       k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
       k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
       *k_smem_offset_r += 32 * UPCAST_STRIDE_K;
@@ -581,27 +555,29 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
     const uint32_t warp_idx_x = get_warp_idx_q<KTraits>(tid.y),
                    warp_idx_z = get_warp_idx_kv<KTraits>(tid.z);
     static_assert(KTraits::NUM_MMA_D_QK % (2 * KTraits::NUM_WARPS_Q) == 0);
-    // horizontal axis: y
-    // vertical axis: z
-    // | (warp_idx_z, warp_idx_x)       | 1-16   | 16-32  | 32-48  | 48-64  | ...
-    // | 1-16*NUM_MMA_KV                | (0, 0) | (0, 1) | (0, 2) | (0, 3) | ...
-    // | 16*NUM_MMA_KV-32*NUM_MMA_KV    | (1, 0) | (1, 1) | (1, 2) | (1, 3) | ...
-    // ...
-    uint32_t kv_idx = kv_idx_base + (warp_idx_z * KTraits::NUM_MMA_KV * 16) + lane_idx / 4;
+    uint32_t kv_idx =
+        tile_kv_start + (warp_idx_z * KTraits::NUM_MMA_KV * 16) + lane_idx / 4;
     *k_smem_offset_r = *k_smem_offset_r ^ (0x2 * warp_idx_x);
 #pragma unroll
     for (uint32_t i = 0; i < KTraits::NUM_MMA_KV; ++i) {
+      const uint32_t kv_local0 = kv_idx - tile_kv_start;
+      const uint32_t kv_word1_0 = kv_tree_smem[kv_local0];
+      const uint32_t kv_word1_1 = kv_tree_smem[kv_local0 + 8];
+      const uint32_t kv_pos0 = tree_info_position_id(kv_word1_0);
+      const uint32_t kv_pos1 = tree_info_position_id(kv_word1_1);
+
       uint32_t k_smem_offset_r_first_half = *k_smem_offset_r;
 #pragma unroll
       for (uint32_t j = 0; j < KTraits::NUM_MMA_D_QK / (2 * KTraits::NUM_WARPS_Q); ++j) {
-        uint32_t mma_di = warp_idx_x + j * KTraits::NUM_WARPS_Q;
+        const uint32_t mma_di = warp_idx_x + j * KTraits::NUM_WARPS_Q;
         k_smem->ldmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
         uint32_t k_smem_offset_r_last_half =
             k_smem->template advance_offset_by_column<KTraits::NUM_MMA_D_QK>(
                 k_smem_offset_r_first_half, 0);
         k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
-        k_frag_apply_llama_rope<DTypeKV>((DTypeKV*)k_frag_local[0], (DTypeKV*)k_frag_local[1],
-                                         rope_freq[mma_di], kv_idx);
+        k_frag_apply_llama_rope_with_pos<DTypeKV>(rope_freq[mma_di], kv_pos0, kv_pos1,
+                                                 (DTypeKV*)k_frag_local[0],
+                                                 (DTypeKV*)k_frag_local[1]);
         k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
         k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
         k_smem_offset_r_first_half =
@@ -753,111 +729,130 @@ __device__ __forceinline__ void logits_transform(
 }
 
 template <typename KTraits, typename Params>
-__device__ __forceinline__ void logits_mask(
+__device__ __forceinline__ void logits_mask_tree(
     const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
-    const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
+    const uint32_t qo_packed_idx_base, const uint32_t tile_q_packed_start,
+    const uint32_t kv_idx_base, const uint32_t tile_kv_start, const uint32_t qo_len,
     const uint32_t kv_len, const uint32_t chunk_end, const uint_fastdiv group_size,
+    const uint32_t* __restrict__ q_tree_smem, const uint32_t* __restrict__ kv_tree_smem,
     typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], const dim3 tid = threadIdx,
     const uint32_t kv_head_idx = blockIdx.z) {
+  constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  constexpr uint32_t q_tree_words_per_q = KTraits::TREE_WORDS_PER_Q;
   const uint32_t lane_idx = tid.x;
-  constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
-  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
-  using DTypeQKAccum = typename KTraits::DTypeQKAccum;
-  constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
-  uint32_t q[NUM_MMA_Q][2], r[NUM_MMA_Q][2];
-#pragma unroll
-  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-    for (uint32_t j = 0; j < 2; ++j) {
-      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
-                        r[mma_q][j]);
-    }
-  }
+  // This is the only supported masking path for tree attention kernels.
+  // `tree_info` format (uint32 words per token, paged like KV-cache):
+  //   tree_info[0]: [is_build(1b) | token_ids(31b)]               (not used in attention)
+  //   tree_info[1]: [is_delete(1b) | position_id(23b) | inner_id(8b)]
+  //   tree_info[2..]: each word packs 4 ancestor inner_id bytes:
+  //     [anc0(8b) | anc1(8b) | anc2(8b) | anc3(8b)] ... up to `anc_array_len` entries
+  //
+  // Q-side shared memory (`q_tree_smem`) stores tree_info[1..] for each packed Q row:
+  //   q_words[0] is tree_info[1], q_words[1] is tree_info[2], ...
+  //
+  // KV-side shared memory (`kv_tree_smem`) stores tree_info[1] for each KV token in the current
+  // CTA_TILE_KV tile.
+  //
+  // Mask rules (as requested):
+  // 1) kv.is_delete == 1 => false
+  // 2) kv.position_id > q.position_id => false
+  // 3) diff = q_pos - kv_pos
+  //    if diff > anc_array_len => false
+  //    if diff == 0 => kv_inner == q_inner
+  //    else:
+  //      diff_slot = diff - 1
+  //      diff_out = diff_slot / 4, diff_inner = diff_slot % 4
+  //      return anc_inner_id(diff_out, diff_inner) == kv_inner
+  //
+  // Notes on implementation:
+  // - Only prefetch q_word1 (do not precompute q_pos/q_inner; derive them on demand).
+  // - Do NOT call variant.LogitsMask: tree kernels only support tree_mask here.
+  // - anc_array_len is guaranteed > 0 (ancestor array always exists).
+  // - Use an early-exit branch for `diff > max_diff` (expected common case).
+
+  // Number of valid ancestor entries (uint8 inner_id) per token.
+  // This drives max distance in position_id space:
+  //   max_diff = anc_array_len   (corresponds to `(MAX_SCHE_LEN - 2) * 4` in the original rule)
+  const uint32_t max_diff = params.anc_array_len;
 
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+    // Precompute Q-side metadata for the two q-selectors (j=0/1) for this mma_q.
+    // These are scalars to avoid local-memory spills.
+    const uint32_t qo_packed_idx0 = qo_packed_idx_base + mma_q * 16 + lane_idx / 4;
+    uint32_t q_idx0 = 0, r0 = 0;
+    group_size.divmod(qo_packed_idx0, q_idx0, r0);
+    const uint32_t q_local0 = qo_packed_idx0 - tile_q_packed_start;
+    const uint32_t q_smem_base0 = q_local0 * q_tree_words_per_q;
+    const uint32_t q_word1_0 = q_tree_smem[q_smem_base0];
+
+    const uint32_t qo_packed_idx1 = qo_packed_idx0 + 8;
+    uint32_t q_idx1 = 0, r1 = 0;
+    group_size.divmod(qo_packed_idx1, q_idx1, r1);
+    const uint32_t q_local1 = qo_packed_idx1 - tile_q_packed_start;
+    const uint32_t q_smem_base1 = q_local1 * q_tree_words_per_q;
+    const uint32_t q_word1_1 = q_tree_smem[q_smem_base1];
+
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
 #pragma unroll
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-        const uint32_t q_idx = q[mma_q][(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
-                                                                    2 * (lane_idx % 4) +
-                                                                    8 * (reg_id / 4) + reg_id % 2;
-        const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
-        const bool mask =
-            (!(MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
-                   ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
-                   : kv_idx >= chunk_end)) &&
-            variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
-        s_frag[mma_q][mma_kv][reg_id] =
-            (mask) ? s_frag[mma_q][mma_kv][reg_id] : (KTraits::MaskFillValue);
-      }
-    }
-  }
-}
+        const uint32_t q_sel = (reg_id % 4) / 2;
+        const uint32_t q_idx = (q_sel == 0) ? q_idx0 : q_idx1;
+        const uint32_t q_smem_base = (q_sel == 0) ? q_smem_base0 : q_smem_base1;
+        [[maybe_unused]] const uint32_t r = (q_sel == 0) ? r0 : r1;
 
-template <typename KTraits, typename Params>
-__device__ __forceinline__ void logits_mask_multi_item_scoring(
-    const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
-    const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
-    const uint32_t kv_len, const uint32_t window_left, const uint32_t chunk_end,
-    const uint_fastdiv group_size, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
-    // new arguments for compact description of mask
-    const uint32_t prefix_len, uint16_t* token_pos_in_items, const uint32_t lane_idx = threadIdx.x,
-    const uint32_t kv_head_idx = blockIdx.z) {
-  constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
-  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
-  using DTypeQKAccum = typename KTraits::DTypeQKAccum;
-  uint32_t q[NUM_MMA_Q][2], r[NUM_MMA_Q][2];
+        // Prefetch q_word1 only; derive q_pos/q_inner on each use (bit ops are cheap).
+        const uint32_t q_word1 = (q_sel == 0) ? q_word1_0 : q_word1_1;
 
-#pragma unroll
-  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-    for (uint32_t j = 0; j < 2; ++j) {
-      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
-                        r[mma_q][j]);
-    }
-  }
-  // prefetching global memory to registers
-  uint16_t token_pos_in_items_regs[NUM_MMA_Q][(4 / 2)];
-#pragma unroll
-  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-    for (uint32_t eff_reg_id = 0; eff_reg_id < (4 / 2); ++eff_reg_id) {
-      const uint32_t q_idx = q[mma_q][eff_reg_id];
-      // use __ldca to hint compiler to cache in L1 for further reuse by other tiles
-      const int idx_in_original_seq = q_idx + kv_len - qo_len;
-      if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-        token_pos_in_items_regs[mma_q][eff_reg_id] =
-            __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
-      }
-    }
-  }
+        const uint32_t kv_idx =
+            kv_idx_base + mma_kv * 16 + 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
+        // qo_head_idx is irrelevant for tree_mask and is not used.
 
-#pragma unroll
-  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-    for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-#pragma unroll
-      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-        const uint32_t q_idx = q[mma_q][(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
-                                                                    2 * (lane_idx % 4) +
-                                                                    8 * (reg_id / 4) + reg_id % 2;
-        const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
-        const uint32_t idx_in_original_seq = q_idx + kv_len - qo_len;
-        const bool out_of_boundary = kv_idx > idx_in_original_seq || (kv_idx >= chunk_end) ||
-                                     kv_idx + window_left < idx_in_original_seq;
-        const bool is_prefix = idx_in_original_seq < prefix_len;
-        if (out_of_boundary || is_prefix) {
+        // Base validity checks (fast exits before touching shared memory).
+        if (kv_idx >= chunk_end || q_idx >= qo_len) {
+          s_frag[mma_q][mma_kv][reg_id] = KTraits::MaskFillValue;
+          continue;
+        }
+
+        // Load kv word1 from shared (out-of-range entries are zero-filled by the loader).
+        const uint32_t kv_local = kv_idx - tile_kv_start;
+        const uint32_t kv_word1 = kv_tree_smem[kv_local];
+
+        // Rule 1: is_delete => false.
+        if (tree_info_is_delete(kv_word1)) {
+          s_frag[mma_q][mma_kv][reg_id] = KTraits::MaskFillValue;
+          continue;
+        }
+
+        // Rule 2/3: diff = q_pos - kv_pos computed in unsigned.
+        // If kv_pos > q_pos, it underflows to a large value and hits the fast-path below.
+        // Fast-path (expected common): diff > max_diff => masked.
+        const uint32_t diff = tree_info_position_id(q_word1) - tree_info_position_id(kv_word1);
+        if (diff > max_diff) {
+          s_frag[mma_q][mma_kv][reg_id] = KTraits::MaskFillValue;
+          continue;
+        }
+
+        // Rule 3 detail (diff == 0 => compare inner_id; otherwise compare ancestor inner_id).
+        if (diff == 0) {
           s_frag[mma_q][mma_kv][reg_id] =
-              out_of_boundary ? (KTraits::MaskFillValue) : s_frag[mma_q][mma_kv][reg_id];
-        } else {
-          s_frag[mma_q][mma_kv][reg_id] =
-              (kv_idx < prefix_len |
-               (idx_in_original_seq < kv_idx + token_pos_in_items_regs[mma_q][((reg_id % 4) / 2)]))
+              (tree_info_inner_id(kv_word1) == tree_info_inner_id(q_word1))
                   ? s_frag[mma_q][mma_kv][reg_id]
                   : (KTraits::MaskFillValue);
+          continue;
         }
+
+        // diff > 0: lookup ancestor inner_id at (diff - 1).
+        const uint32_t diff_slot = diff - 1;
+        const uint32_t diff_out = diff_slot >> 2;      // /4 -> packed ancestor word index
+        const uint32_t diff_inner = diff_slot & 0x3u;  // %4 -> byte index within packed word
+        const uint32_t anc_word = q_tree_smem[q_smem_base + 1 + diff_out];
+        const uint32_t anc_inner = (anc_word >> (8 * diff_inner)) & 0xFFu;
+        s_frag[mma_q][mma_kv][reg_id] =
+            (anc_inner == tree_info_inner_id(kv_word1)) ? s_frag[mma_q][mma_kv][reg_id]
+                                                        : (KTraits::MaskFillValue);
       }
     }
   }
@@ -1360,23 +1355,6 @@ __device__ __forceinline__ void BatchTreeWithPagedKVCacheDevice(
     const bool partition_kv = params.partition_kv;
     const uint_fastdiv& group_size = params.group_size;
 
-    uint32_t* maybe_prefix_len_ptr = nullptr;
-    if constexpr (has_maybe_prefix_len_ptr_v<Params>) {
-      maybe_prefix_len_ptr = params.maybe_prefix_len_ptr;
-    }
-    uint16_t* maybe_token_pos_in_items_ptr = nullptr;
-    if constexpr (has_maybe_token_pos_in_items_ptr_v<Params>) {
-      maybe_token_pos_in_items_ptr = params.maybe_token_pos_in_items_ptr;
-    }
-    uint32_t token_pos_in_items_len = 0;
-    if constexpr (has_token_pos_in_items_len_v<Params>) {
-      token_pos_in_items_len = params.token_pos_in_items_len;
-    }
-    uint16_t* maybe_max_item_len_ptr = nullptr;
-    if constexpr (has_maybe_max_item_len_ptr_v<Params>) {
-      maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
-    }
-
     static_assert(sizeof(DTypeQ) == 2);
     auto block = cg::this_thread_block();
     const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
@@ -1420,6 +1398,7 @@ __device__ __forceinline__ void BatchTreeWithPagedKVCacheDevice(
 
     const uint32_t qo_packed_idx_base =
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
+    const uint32_t tile_q_packed_start = qo_tile_idx * CTA_TILE_Q;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
     const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
@@ -1442,21 +1421,27 @@ __device__ __forceinline__ void BatchTreeWithPagedKVCacheDevice(
 
     cp_async::commit_group();
 
+    // Tree kernels always require tree_info and always apply tree_mask.
+    // Kernel is compiled with a fixed `TREE_WORDS_PER_Q` (JIT parameter).
+    // Each token needs:
+    // - 1 word for tree_info[1] (pos/inner/delete)
+    // - ceil(anc_array_len / 4) words for packed ancestor bytes from tree_info[2..]
+    // The runtime anc_array_len must fit in the compiled capacity.
+    constexpr uint32_t tree_words_per_q = KTraits::TREE_WORDS_PER_Q;
+    const uint32_t anc_words = (params.anc_array_len + 3) / 4;
+    (void)tree_words_per_q;
+    (void)anc_words;
+    // Overlap q_tree_info global loads with in-flight Q cp.async.
+    load_q_tree_info_smem<KTraits>(params, request_idx, qo_tile_idx, qo_len, kv_len, group_size,
+                                   smem_storage.q_tree_smem, tid);
+
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       cp_async::wait_group<0>();
       block.sync();
-      IdType* q_rope_offset = nullptr;
-      if constexpr (has_maybe_q_rope_offset_v<Params>) {
-        q_rope_offset = params.maybe_q_rope_offset;
-      }
-      if (q_rope_offset == nullptr) {
-        q_smem_inplace_apply_rotary<KTraits>(qo_packed_idx_base, qo_len, kv_len, group_size,
-                                             &qo_smem, &q_smem_offset_r, rope_freq, tid);
-      } else {
-        q_smem_inplace_apply_rotary_with_pos<KTraits>(
-            qo_packed_idx_base, q_rope_offset + q_indptr[request_idx], &qo_smem, group_size,
-            &q_smem_offset_r, rope_freq, tid);
-      }
+      // Tree attention uses position_id from tree_info for relative RoPE.
+      q_smem_inplace_apply_rotary_tree<KTraits>(qo_packed_idx_base, tile_q_packed_start,
+                                                smem_storage.q_tree_smem, &qo_smem,
+                                                &q_smem_offset_r, rope_freq, tid);
       block.sync();
     }
 
@@ -1498,71 +1483,11 @@ __device__ __forceinline__ void BatchTreeWithPagedKVCacheDevice(
                                    thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
     cp_async::commit_group();
 
-    uint32_t num_iterations_prefix;
-    uint32_t num_iterations_mask;
-    uint32_t num_iterations = 0;
-
-    if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-      num_iterations = ceil_div(
-          (MASK_MODE == MaskMode::kCausal
-               ? min(chunk_size,
-                     sub_if_greater_or_zero(
-                         kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
-                         chunk_start))
-               : chunk_size),
-          CTA_TILE_KV);
-    } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
-      num_iterations_prefix = ceil_div(
-          min(min(chunk_size,
-                  sub_if_greater_or_zero(
-                      kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
-                      chunk_start)),
-              sub_if_greater_or_zero(__ldg(maybe_prefix_len_ptr + request_idx), chunk_start)),
-          CTA_TILE_KV);
-      num_iterations_mask =
-          max(min(chunk_size,
-                  sub_if_greater_or_zero(
-                      sub_if_greater_or_zero(
-                          kv_len - qo_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size),
-                          __ldg(maybe_max_item_len_ptr + request_idx)),
-                      chunk_start)) /
-                  (CTA_TILE_KV),
-              num_iterations_prefix);
-
-      num_iterations = max(
-          num_iterations_mask,
-          ceil_div(min(chunk_size,
-                       sub_if_greater_or_zero(
-                           kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
-                           chunk_start)),
-                   CTA_TILE_KV));
-    }
-
-    const uint32_t window_iteration = ceil_div(
-        sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size),
-                               qo_len + window_left + chunk_start),
-        CTA_TILE_KV);
-
-    const uint32_t mask_iteration =
-        (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
-             ? min(chunk_size,
-                   sub_if_greater_or_zero(
-                       kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
-                       chunk_start))
-             : chunk_size) /
-        CTA_TILE_KV;
+    const uint32_t num_iterations = ceil_div(chunk_size, CTA_TILE_KV);
 
 #pragma unroll 1
-    for (uint32_t iter = 0; iter < num_iterations;
-         iter = (MASK_MODE == MaskMode::kMultiItemScoring)
-                    ? ((iter + 1 == num_iterations_prefix) ? num_iterations_mask : (iter + 1))
-                    : (iter + 1)) {
-      const uint32_t prefetch_skip_step =
-          (MASK_MODE == MaskMode::kMultiItemScoring)
-              ? ((iter + 1 == num_iterations_prefix) ? (num_iterations_mask - num_iterations_prefix)
-                                                     : 0)
-              : 0;
-      packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
+    for (uint32_t iter = 0; iter < num_iterations; ++iter) {
+      packed_page_iter_base += CTA_TILE_KV;
 #pragma unroll
       for (uint32_t i = 0;
            i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q; ++i) {
@@ -1575,14 +1500,17 @@ __device__ __forceinline__ void BatchTreeWithPagedKVCacheDevice(
             page_iter, kv_head_idx, entry_idx,
             (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
       }
+      const uint32_t tile_kv_start = chunk_start + iter * CTA_TILE_KV;
+      // Overlap kv_tree_info global loads with in-flight KV cp.async.
+      load_kv_tree_word1_smem<KTraits>(params, request_idx, tile_kv_start, chunk_end,
+                                       smem_storage.kv_tree_smem, tid);
       cp_async::wait_group<1>();
       block.sync();
 
       if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-        k_smem_inplace_apply_rotary<KTraits>(
-            (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]) +
-                chunk_start + iter * CTA_TILE_KV,
-            &k_smem, &k_smem_offset_r, rope_freq, tid);
+        // Tree attention uses position_id from tree_info for relative RoPE.
+        k_smem_inplace_apply_rotary_tree<KTraits>(tile_kv_start, smem_storage.kv_tree_smem, &k_smem,
+                                                  &k_smem_offset_r, rope_freq, tid);
         block.sync();
       }
 
@@ -1594,34 +1522,10 @@ __device__ __forceinline__ void BatchTreeWithPagedKVCacheDevice(
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       // apply mask
-      if (MASK_MODE == MaskMode::kCustom) {
-        logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                             kv_head_idx);
-      } else {
-        if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-          if (iter >= mask_iteration || iter < window_iteration) {
-            logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                 kv_head_idx);
-          }
-        } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
-          if (iter + 1 >= num_iterations_prefix) {
-            logits_mask_multi_item_scoring<KTraits>(
-                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base, qo_len,
-                kv_len, window_left, chunk_end, group_size, s_frag,
-                __ldg(maybe_prefix_len_ptr + request_idx),
-                maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
-                kv_head_idx);
-          } else {
-            if (iter >= mask_iteration || iter < window_iteration) {
-              logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                   kv_head_idx);
-            }
-          }
-        }
-      }
+      logits_mask_tree<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                tile_q_packed_start, kv_idx_base, tile_kv_start, qo_len, kv_len,
+                                chunk_end, group_size, smem_storage.q_tree_smem,
+                                smem_storage.kv_tree_smem, s_frag, tid, kv_head_idx);
 
       // compute m,d states in online softmax
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
@@ -1710,7 +1614,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchTreeWithPagedKVCach
   BatchTreeWithPagedKVCacheDevice<KTraits>(params, smem_storage);
 }
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, uint32_t TREE_WORDS_PER_Q,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchTreeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
@@ -1746,10 +1650,16 @@ cudaError_t BatchTreeWithPagedKVCacheDispatched(Params params, typename Params::
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  // Tree kernels always require tree_info and always apply tree_mask.
+  // All consistency checks are enforced at Python/C++ entrypoints; keep the kernel fast here.
+  const size_t q_tree_bytes = size_t(CTA_TILE_Q) * size_t(TREE_WORDS_PER_Q) * sizeof(uint32_t);
+  const size_t q_bytes = size_t(CTA_TILE_Q) * size_t(HEAD_DIM_QK) * sizeof(DTypeQ) + q_tree_bytes;
+  const size_t kv_bytes_per_mma = size_t(16) * size_t(NUM_WARPS_KV) *
+                                  (size_t(HEAD_DIM_QK + HEAD_DIM_VO) * sizeof(DTypeKV) +
+                                   sizeof(uint32_t));
   // we expect each sm execute two threadblocks
   const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+      max_smem_per_sm >= 2 * (q_bytes + kv_bytes_per_mma)
           ? 2
           : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
@@ -1760,14 +1670,16 @@ cudaError_t BatchTreeWithPagedKVCacheDispatched(Params params, typename Params::
           ? 2
           : (8 / NUM_MMA_Q);
   const uint32_t max_num_mma_kv_smem =
-      (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
-      ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
+      (static_cast<size_t>(max_smem_per_threadblock) > q_bytes)
+          ? static_cast<uint32_t>((static_cast<size_t>(max_smem_per_threadblock) - q_bytes) /
+                                  kv_bytes_per_mma)
+          : 0;
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
-        KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                     NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+        KernelTraits<MASK_MODE, CTA_TILE_Q, TREE_WORDS_PER_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
+                     NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV,
+                     DTypeO, DTypeQKAccum, typename Params::IdType, AttentionVariant>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
@@ -1779,6 +1691,7 @@ cudaError_t BatchTreeWithPagedKVCacheDispatched(Params params, typename Params::
                  " and report the issue to the developers.";
       FLASHINFER_ERROR(err_msg.str());
     } else {
+      // All shared memory (including tree metadata staging) is embedded in SharedStorage.
       size_t smem_size = sizeof(typename KTraits::SharedStorage);
       auto kernel = BatchTreeWithPagedKVCacheKernel<KTraits, Params>;
       FLASHINFER_CUDA_CALL(

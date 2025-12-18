@@ -25,6 +25,7 @@
 namespace flashinfer {
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          uint32_t TREE_WORDS_PER_Q,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchTreeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
@@ -71,7 +72,9 @@ Array<int64_t> BatchTreeWithKVCachePlan(
 
 void BatchTreeWithPagedKVCacheRun(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
                                  Array<int64_t> plan_info_vec, TensorView q, TensorView paged_k_cache,
-                                 TensorView paged_v_cache, TensorView qo_indptr,
+                                 TensorView paged_v_cache, TensorView tree_info,
+                                 int64_t anc_array_len,
+                                 TensorView qo_indptr,
                                  TensorView paged_kv_indptr, TensorView paged_kv_indices,
                                  TensorView paged_kv_last_page_len, TensorView o,
                                  Optional<TensorView> maybe_lse, int64_t mask_mode_code, int64_t layout,
@@ -86,6 +89,18 @@ void BatchTreeWithPagedKVCacheRun(TensorView float_workspace_buffer, TensorView 
   int64_t page_size = paged_k_cache.size(1);
   int64_t batch_size = paged_kv_last_page_len.size(0);
   int64_t num_kv_heads = (kv_layout == QKVLayout::kNHD) ? paged_k_cache.size(2) : paged_k_cache.size(1);
+
+  // tree_info: [max_num_pages, page_size, MAX_SCHE_LEN], uint32
+  TVM_FFI_ICHECK_EQ(tree_info.ndim(), 3) << "tree_info must be a 3-D tensor";
+  TVM_FFI_ICHECK_EQ(tree_info.size(1), page_size) << "tree_info.page_size must match KV page_size";
+  TVM_FFI_ICHECK(tree_info.size(2) >= 2) << "tree_info MAX_SCHE_LEN must be >= 2";
+  TVM_FFI_ICHECK(anc_array_len > 0) << "anc_array_len must be > 0";
+  const int64_t anc_words = (anc_array_len + 3) / 4;
+  TVM_FFI_ICHECK(TREE_WORDS_PER_Q > 0) << "TREE_WORDS_PER_Q must be > 0";
+  TVM_FFI_ICHECK(anc_words <= (static_cast<int64_t>(TREE_WORDS_PER_Q) - 1))
+      << "anc_array_len exceeds compiled TREE_WORDS_PER_Q capacity";
+  TVM_FFI_ICHECK(tree_info.size(2) >= static_cast<int64_t>(1 + TREE_WORDS_PER_Q))
+      << "tree_info MAX_SCHE_LEN is insufficient for TREE_WORDS_PER_Q";
 
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
@@ -107,6 +122,8 @@ void BatchTreeWithPagedKVCacheRun(TensorView float_workspace_buffer, TensorView 
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+  TVM_FFI_ICHECK(mask_mode == MaskMode::kNone)
+      << "BatchTree only supports tree_mask, please pass mask_mode=NonCausal(kNone)";
 
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
@@ -125,6 +142,12 @@ void BatchTreeWithPagedKVCacheRun(TensorView float_workspace_buffer, TensorView 
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
         params.paged_kv = paged_kv;
+        params.tree_info = static_cast<uint32_t*>(tree_info.data_ptr());
+        params.tree_info_stride_page = tree_info.stride(0);
+        params.tree_info_stride_entry = tree_info.stride(1);
+        params.tree_info_stride_word = tree_info.stride(2);
+        params.tree_info_sche_len = static_cast<uint32_t>(tree_info.size(2));
+        params.anc_array_len = static_cast<uint32_t>(anc_array_len);
         params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
         params.o = static_cast<DTypeO*>(o.data_ptr());
         params.lse =
@@ -182,7 +205,7 @@ void BatchTreeWithPagedKVCacheRun(TensorView float_workspace_buffer, TensorView 
 
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchTreeWithPagedKVCacheDispatched<
-              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, TREE_WORDS_PER_Q, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
               PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
         });

@@ -403,6 +403,7 @@ def get_batch_tree_uri(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    tree_words_per_q: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -415,6 +416,7 @@ def get_batch_tree_uri(
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
+        f"tree_words_per_q_{tree_words_per_q}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
@@ -1106,6 +1108,7 @@ def gen_customize_batch_tree_module(
     idtype: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    tree_words_per_q: int,
     additional_tensor_names: List[str],
     additional_tensor_dtypes: List[str],
     additional_scalar_names: List[str],
@@ -1132,6 +1135,7 @@ def gen_customize_batch_tree_module(
         "idtype": dtype_map[idtype],
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
+        "tree_words_per_q": tree_words_per_q,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
@@ -1197,6 +1201,7 @@ def gen_batch_tree_module(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    tree_words_per_q: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -1210,6 +1215,7 @@ def gen_batch_tree_module(
         dtype_idx,
         head_dim_qk,
         head_dim_vo,
+        tree_words_per_q,
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
@@ -1258,6 +1264,7 @@ def gen_batch_tree_module(
         dtype_idx,
         head_dim_qk,
         head_dim_vo,
+        tree_words_per_q,
         additional_tensor_names,
         additional_tensor_dtypes,
         additional_scalar_names,

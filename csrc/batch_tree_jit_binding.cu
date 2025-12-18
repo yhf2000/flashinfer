@@ -29,7 +29,9 @@ Array<int64_t> BatchTreeWithKVCachePlan(
 
 void BatchTreeWithPagedKVCacheRun(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
                                  Array<int64_t> plan_info_vec, TensorView q, TensorView paged_k_cache,
-                                 TensorView paged_v_cache, TensorView qo_indptr,
+                                 TensorView paged_v_cache, TensorView tree_info,
+                                 int64_t anc_array_len,
+                                 TensorView qo_indptr,
                                  TensorView paged_kv_indptr, TensorView paged_kv_indices,
                                  TensorView paged_kv_last_page_len, TensorView o,
                                  Optional<TensorView> maybe_lse, int64_t mask_mode_code, int64_t layout,
